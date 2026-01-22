@@ -393,22 +393,23 @@
   - `mcp_spec_next.md` declares itself the “source-of-truth” with stable wire formats, but its wire layout and constants conflict with `mcp_spec.md` and current code (e.g., 4-byte proposer_index and 1-byte witness_len vs 1-byte proposer_id and 2-byte witness_len). Until reconciled, `mcp_spec_next.md` should not be treated as “better” or authoritative (`mcp_spec_next.md:1`, `mcp_spec_next.md:106`, `mcp_spec_next.md:365`).
   - MTU constraint is not consistently specified: `mcp_spec_next.md` hardcodes 1225-byte shreds but does not state the assumed MTU or overhead model, while `mcp_spec.md` uses `MAX_SHRED_DATA_SIZE` 1,228 without packet sizing context. The source-of-truth spec must define the exact MTU budget and overhead (IP/UDP/QUIC, signatures, proof sizes) or the wire format cannot be validated (`mcp_spec.md:92`, `mcp_spec_next.md:91`).
 - Spec-as-source-of-truth deviations (code is buggy where it diverges):
-  - Schedule pool size must equal role count (16/200), but code uses the full validator set as pool (`mcp_spec.md:113`, `ledger/src/mcp_schedule.rs:56`).
-  - Shred common header offsets require `fec_set_index` at bytes 80-83, but `ledger/src/shred/merkle.rs` still reads 79-83, so MCP header parsing is inconsistent with spec (`mcp_spec.md:219`, `ledger/src/shred/merkle.rs:200`).
-  - Proposer ordering must sort by ordering_fee then tx hash; bankless recorder preserves input order only (`mcp_spec.md:289`, `core/src/mcp_bankless.rs:96`).
-  - Witness length must be capped at 8 entries, but relay parsing accepts unbounded witness sizes (`mcp_spec.md:326`, `turbine/src/mcp_relay.rs:224`).
-  - Batch limits in spec (65,536 tx, 10 MB, 1,228-byte shreds) are not enforced or are enforced with different constants (`mcp_spec.md:87`, `core/src/mcp_bankless.rs:114`).
-  - Verification failures must be silently dropped, but relay processing returns error variants and does not codify the silent-drop policy (`mcp_spec.md:346`, `turbine/src/mcp_relay.rs:224`).
-  - Fee payer balance must cover `NUM_PROPOSERS * total_fee`, but `svm/src/mcp_fee_payer.rs` only checks spendable balance and is not integrated into execution, violating spec (`mcp_spec.md:482`, `svm/src/mcp_fee_payer.rs:94`).
-  - Replay reconstruction must use Reed-Solomon and verify commitments; `core/src/mcp_replay.rs` uses threshold logic without erasure recovery or merkle verification (`mcp_spec.md:437`, `core/src/mcp_replay.rs:88`).
-  - Relay attestation aggregation must verify relay signatures; `core/src/mcp_attestation_service.rs` assumes verification elsewhere (`mcp_spec.md:365`, `core/src/mcp_attestation_service.rs:170`).
+  - [FIXED] Schedule pool size now equals role count (16/200) in `ledger/src/mcp_schedule.rs`.
+  - [FIXED] Shred common header offsets now correctly read `fec_set_index` at bytes 80-83 in `ledger/src/shred/merkle.rs`.
+  - [FIXED] Proposer ordering now sorts by ordering_fee DESC then tx hash ASC via `sort_for_serialization()` in `core/src/mcp_bankless.rs`.
+  - [FIXED] Witness length capped at 8 entries (160 bytes) with `MAX_WITNESS_BYTES` check in `turbine/src/mcp_relay.rs`.
+  - [FIXED] Batch limits aligned with spec (65,536 tx, 38,080 bytes, 4,096 max tx size) in `core/src/mcp_bankless.rs`.
+  - [FIXED] Verification failures silently dropped via `Option<ValidatedShred>` return type in `turbine/src/mcp_relay.rs`.
+  - [FIXED] Fee payer balance check now covers `NUM_PROPOSERS * total_fee` in `svm/src/mcp_fee_payer.rs:can_commit()`.
+  - [OPEN] Replay reconstruction must use Reed-Solomon and verify commitments; `core/src/mcp_replay.rs` uses threshold logic without erasure recovery or merkle verification (`mcp_spec.md:437`, `core/src/mcp_replay.rs:88`).
+  - [FIXED] Relay attestation aggregation now verifies relay signatures in `core/src/mcp_attestation_service.rs:add_attestation()`.
 - API compatibility concerns:
   - Shred header size change not consistently handled; legacy shreds and merkle offsets are inconsistent.
 - Dependency changes:
   - No new dependencies; new modules use existing crates.
 - Performance/regression risks:
-  - Unbounded allocation in deserializers (bankless batches, relay messages) and large witness vectors without limits.
-  - Schedule generation may produce duplicate proposers/relays per slot.
+  - [FIXED] Bankless batch deserialization now has bounds checks (MAX_TRANSACTIONS_PER_BATCH, MAX_TRANSACTION_SIZE, MAX_BATCH_SIZE).
+  - [FIXED] Witness vectors now limited to MAX_WITNESS_BYTES (160 bytes, 8 entries).
+  - [FIXED] Schedule generation uses modular indexing to avoid duplicates per slot.
 
 ## Commands run + results (this iteration)
 - `git rev-parse --show-toplevel`
