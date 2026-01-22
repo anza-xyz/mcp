@@ -17,7 +17,11 @@
 //! - `RECONSTRUCTION_THRESHOLD`: Minimum stake fraction of shreds needed to
 //!   reconstruct a proposer's batch (20%)
 
-use solana_votor_messages::fraction::Fraction;
+use {
+    solana_pubkey::Pubkey,
+    solana_votor_messages::fraction::Fraction,
+    std::io::{self, Read, Write},
+};
 
 /// Number of proposers that can submit batches per slot.
 ///
@@ -197,5 +201,337 @@ mod tests {
         let min_shreds_for_recovery =
             (MCP_SHREDS_PER_FEC_BLOCK as f64 * 0.2).ceil() as usize;
         assert_eq!(min_shreds_for_recovery, MCP_DATA_SHREDS_PER_FEC_BLOCK);
+    }
+}
+
+/// MCP Transaction Configuration Module
+///
+/// Defines the extended transaction format for MCP including:
+/// - `inclusion_fee`: Fee paid to proposers for including the transaction
+/// - `ordering_fee`: Fee paid for transaction ordering priority
+/// - `target_proposer`: Optional target proposer for the transaction
+pub mod transaction {
+    use super::*;
+
+    /// Bit flags for MCP transaction configuration mask.
+    ///
+    /// These flags indicate which optional fields are present in the
+    /// serialized MCP transaction config.
+    pub mod config_mask {
+        /// Indicates inclusion_fee field is present
+        pub const INCLUSION_FEE: u8 = 0b0000_0001;
+        /// Indicates ordering_fee field is present
+        pub const ORDERING_FEE: u8 = 0b0000_0010;
+        /// Indicates target_proposer field is present
+        pub const TARGET_PROPOSER: u8 = 0b0000_0100;
+    }
+
+    /// MCP-specific transaction configuration.
+    ///
+    /// This config extends standard Solana transactions with MCP-specific
+    /// fee fields and targeting options. When serialized, only non-default
+    /// fields are included, prefixed by a config mask byte.
+    ///
+    /// # Serialization Format
+    ///
+    /// ```text
+    /// | config_mask (1 byte) | inclusion_fee (8 bytes, optional) |
+    /// | ordering_fee (8 bytes, optional) | target_proposer (32 bytes, optional) |
+    /// ```
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+    pub struct McpTransactionConfig {
+        /// Fee paid to proposers for data availability.
+        ///
+        /// This fee is charged regardless of transaction execution outcome
+        /// and compensates proposers for including the transaction in their
+        /// batch. Paid in lamports.
+        pub inclusion_fee: u64,
+
+        /// Fee paid for transaction ordering priority.
+        ///
+        /// Higher ordering fees result in earlier execution within the
+        /// proposer's batch. Paid in lamports.
+        pub ordering_fee: u64,
+
+        /// Optional target proposer ID.
+        ///
+        /// If set, the transaction should only be processed by the specified
+        /// proposer. This allows users to select a specific proposer for
+        /// their transactions. If `None`, any proposer may include it.
+        pub target_proposer: Option<Pubkey>,
+    }
+
+    impl McpTransactionConfig {
+        /// Create a new MCP transaction config with the specified fees.
+        pub const fn new(inclusion_fee: u64, ordering_fee: u64) -> Self {
+            Self {
+                inclusion_fee,
+                ordering_fee,
+                target_proposer: None,
+            }
+        }
+
+        /// Create a new MCP transaction config targeting a specific proposer.
+        pub const fn with_target_proposer(
+            inclusion_fee: u64,
+            ordering_fee: u64,
+            target_proposer: Pubkey,
+        ) -> Self {
+            Self {
+                inclusion_fee,
+                ordering_fee,
+                target_proposer: Some(target_proposer),
+            }
+        }
+
+        /// Returns the config mask byte indicating which fields are present.
+        pub fn config_mask(&self) -> u8 {
+            let mut mask = 0u8;
+            if self.inclusion_fee > 0 {
+                mask |= config_mask::INCLUSION_FEE;
+            }
+            if self.ordering_fee > 0 {
+                mask |= config_mask::ORDERING_FEE;
+            }
+            if self.target_proposer.is_some() {
+                mask |= config_mask::TARGET_PROPOSER;
+            }
+            mask
+        }
+
+        /// Returns the total MCP fees (inclusion + ordering).
+        pub const fn total_mcp_fees(&self) -> u64 {
+            self.inclusion_fee.saturating_add(self.ordering_fee)
+        }
+
+        /// Serialize the MCP transaction config to bytes.
+        ///
+        /// Only non-default fields are serialized, prefixed by the config mask.
+        pub fn serialize<W: Write>(&self, writer: &mut W) -> io::Result<usize> {
+            let mask = self.config_mask();
+            writer.write_all(&[mask])?;
+            let mut bytes_written = 1;
+
+            if mask & config_mask::INCLUSION_FEE != 0 {
+                writer.write_all(&self.inclusion_fee.to_le_bytes())?;
+                bytes_written += 8;
+            }
+            if mask & config_mask::ORDERING_FEE != 0 {
+                writer.write_all(&self.ordering_fee.to_le_bytes())?;
+                bytes_written += 8;
+            }
+            if mask & config_mask::TARGET_PROPOSER != 0 {
+                if let Some(pubkey) = &self.target_proposer {
+                    writer.write_all(pubkey.as_ref())?;
+                    bytes_written += 32;
+                }
+            }
+
+            Ok(bytes_written)
+        }
+
+        /// Deserialize MCP transaction config from bytes.
+        pub fn deserialize<R: Read>(reader: &mut R) -> io::Result<Self> {
+            let mut mask_buf = [0u8; 1];
+            reader.read_exact(&mut mask_buf)?;
+            let mask = mask_buf[0];
+
+            let inclusion_fee = if mask & config_mask::INCLUSION_FEE != 0 {
+                let mut buf = [0u8; 8];
+                reader.read_exact(&mut buf)?;
+                u64::from_le_bytes(buf)
+            } else {
+                0
+            };
+
+            let ordering_fee = if mask & config_mask::ORDERING_FEE != 0 {
+                let mut buf = [0u8; 8];
+                reader.read_exact(&mut buf)?;
+                u64::from_le_bytes(buf)
+            } else {
+                0
+            };
+
+            let target_proposer = if mask & config_mask::TARGET_PROPOSER != 0 {
+                let mut buf = [0u8; 32];
+                reader.read_exact(&mut buf)?;
+                Some(Pubkey::from(buf))
+            } else {
+                None
+            };
+
+            Ok(Self {
+                inclusion_fee,
+                ordering_fee,
+                target_proposer,
+            })
+        }
+
+        /// Returns the serialized size in bytes.
+        pub fn serialized_size(&self) -> usize {
+            let mask = self.config_mask();
+            let mut size = 1; // config mask byte
+            if mask & config_mask::INCLUSION_FEE != 0 {
+                size += 8;
+            }
+            if mask & config_mask::ORDERING_FEE != 0 {
+                size += 8;
+            }
+            if mask & config_mask::TARGET_PROPOSER != 0 {
+                size += 32;
+            }
+            size
+        }
+    }
+
+    /// Extended fee details that include MCP-specific fees.
+    ///
+    /// This wraps the standard FeeDetails with additional MCP fees.
+    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+    pub struct McpFeeDetails {
+        /// Standard transaction fee (signature fees)
+        pub transaction_fee: u64,
+        /// Standard prioritization fee
+        pub prioritization_fee: u64,
+        /// MCP inclusion fee (charged regardless of execution)
+        pub inclusion_fee: u64,
+        /// MCP ordering fee (for priority within proposer batch)
+        pub ordering_fee: u64,
+    }
+
+    impl McpFeeDetails {
+        /// Create new MCP fee details.
+        pub const fn new(
+            transaction_fee: u64,
+            prioritization_fee: u64,
+            inclusion_fee: u64,
+            ordering_fee: u64,
+        ) -> Self {
+            Self {
+                transaction_fee,
+                prioritization_fee,
+                inclusion_fee,
+                ordering_fee,
+            }
+        }
+
+        /// Returns the total of all fees.
+        pub const fn total_fee(&self) -> u64 {
+            self.transaction_fee
+                .saturating_add(self.prioritization_fee)
+                .saturating_add(self.inclusion_fee)
+                .saturating_add(self.ordering_fee)
+        }
+
+        /// Returns the total MCP-specific fees (inclusion + ordering).
+        pub const fn total_mcp_fees(&self) -> u64 {
+            self.inclusion_fee.saturating_add(self.ordering_fee)
+        }
+
+        /// Returns the total standard fees (transaction + prioritization).
+        pub const fn total_standard_fees(&self) -> u64 {
+            self.transaction_fee.saturating_add(self.prioritization_fee)
+        }
+
+        /// Fees that are charged regardless of transaction execution outcome.
+        ///
+        /// In MCP, inclusion fees are always charged to compensate proposers
+        /// for data availability, even if the transaction fails.
+        pub const fn fees_charged_regardless_of_execution(&self) -> u64 {
+            self.inclusion_fee
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn test_default_config() {
+            let config = McpTransactionConfig::default();
+            assert_eq!(config.inclusion_fee, 0);
+            assert_eq!(config.ordering_fee, 0);
+            assert!(config.target_proposer.is_none());
+            assert_eq!(config.config_mask(), 0);
+        }
+
+        #[test]
+        fn test_config_with_fees() {
+            let config = McpTransactionConfig::new(1000, 500);
+            assert_eq!(config.inclusion_fee, 1000);
+            assert_eq!(config.ordering_fee, 500);
+            assert!(config.target_proposer.is_none());
+            assert_eq!(config.total_mcp_fees(), 1500);
+            assert_eq!(
+                config.config_mask(),
+                config_mask::INCLUSION_FEE | config_mask::ORDERING_FEE
+            );
+        }
+
+        #[test]
+        fn test_config_with_target_proposer() {
+            let proposer = Pubkey::new_unique();
+            let config = McpTransactionConfig::with_target_proposer(100, 50, proposer);
+            assert_eq!(config.target_proposer, Some(proposer));
+            assert_eq!(
+                config.config_mask(),
+                config_mask::INCLUSION_FEE
+                    | config_mask::ORDERING_FEE
+                    | config_mask::TARGET_PROPOSER
+            );
+        }
+
+        #[test]
+        fn test_serialization_roundtrip() {
+            let proposer = Pubkey::new_unique();
+            let original = McpTransactionConfig::with_target_proposer(1000, 500, proposer);
+
+            let mut buffer = Vec::new();
+            let written = original.serialize(&mut buffer).unwrap();
+            assert_eq!(written, original.serialized_size());
+
+            let mut cursor = std::io::Cursor::new(&buffer);
+            let deserialized = McpTransactionConfig::deserialize(&mut cursor).unwrap();
+
+            assert_eq!(original, deserialized);
+        }
+
+        #[test]
+        fn test_serialization_empty_config() {
+            let config = McpTransactionConfig::default();
+            let mut buffer = Vec::new();
+            let written = config.serialize(&mut buffer).unwrap();
+            assert_eq!(written, 1); // Only mask byte
+
+            let mut cursor = std::io::Cursor::new(&buffer);
+            let deserialized = McpTransactionConfig::deserialize(&mut cursor).unwrap();
+            assert_eq!(config, deserialized);
+        }
+
+        #[test]
+        fn test_serialization_partial_config() {
+            // Only inclusion fee
+            let config = McpTransactionConfig {
+                inclusion_fee: 1000,
+                ordering_fee: 0,
+                target_proposer: None,
+            };
+            let mut buffer = Vec::new();
+            config.serialize(&mut buffer).unwrap();
+            assert_eq!(buffer.len(), 9); // 1 mask + 8 inclusion_fee
+
+            let mut cursor = std::io::Cursor::new(&buffer);
+            let deserialized = McpTransactionConfig::deserialize(&mut cursor).unwrap();
+            assert_eq!(config, deserialized);
+        }
+
+        #[test]
+        fn test_mcp_fee_details() {
+            let fees = McpFeeDetails::new(5000, 1000, 2000, 500);
+            assert_eq!(fees.total_fee(), 8500);
+            assert_eq!(fees.total_mcp_fees(), 2500);
+            assert_eq!(fees.total_standard_fees(), 6000);
+            assert_eq!(fees.fees_charged_regardless_of_execution(), 2000);
+        }
     }
 }
