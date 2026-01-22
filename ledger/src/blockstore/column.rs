@@ -288,6 +288,86 @@ pub mod columns {
     /// * index type: `(Slot, BlockLocation)`
     /// * value type: [`blockstore_meta::DoubleMerkleMeta`]
     pub struct DoubleMerkleMeta;
+
+    // =========================================================================
+    // MCP (Multiple Concurrent Proposers) columns
+    // =========================================================================
+
+    #[derive(Debug)]
+    /// MCP proposer shred data column.
+    ///
+    /// This column stores data shreds from MCP proposers, keyed by
+    /// slot, proposer_id, and shred_index. This allows multiple proposers
+    /// to submit shreds for the same slot without key collisions.
+    ///
+    /// * index type: `(Slot, proposer_id: u8, shred_index: u64)`
+    /// * value type: `Vec<u8>`
+    pub struct McpShredData;
+
+    #[derive(Debug)]
+    /// MCP proposer shred code (erasure) column.
+    ///
+    /// Similar to [`McpShredData`], stores coding shreds for erasure recovery.
+    ///
+    /// * index type: `(Slot, proposer_id: u8, shred_index: u64)`
+    /// * value type: `Vec<u8>`
+    pub struct McpShredCode;
+
+    #[derive(Debug)]
+    /// MCP proposer slot metadata column.
+    ///
+    /// Tracks the status of received shred data for a given slot and proposer.
+    ///
+    /// * index type: `(Slot, proposer_id: u8)`
+    /// * value type: [`blockstore_meta::SlotMeta`]
+    pub struct McpSlotMeta;
+
+    #[derive(Debug)]
+    /// MCP proposer erasure metadata column.
+    ///
+    /// Stores ErasureMeta for MCP proposer shreds.
+    ///
+    /// * index type: `(Slot, proposer_id: u8, fec_set_index: u32)`
+    /// * value type: [`blockstore_meta::ErasureMeta`]
+    pub struct McpErasureMeta;
+
+    #[derive(Debug)]
+    /// MCP proposer merkle root metadata column.
+    ///
+    /// Stores merkle root metadata for MCP proposer FEC sets.
+    ///
+    /// * index type: `(Slot, proposer_id: u8, fec_set_index: u32)`
+    /// * value type: [`blockstore_meta::MerkleRootMeta`]
+    pub struct McpMerkleRootMeta;
+
+    #[derive(Debug)]
+    /// MCP proposer index column.
+    ///
+    /// Tracks which shreds have been received for each proposer.
+    ///
+    /// * index type: `(Slot, proposer_id: u8)`
+    /// * value type: [`blockstore_meta::Index`]
+    pub struct McpIndex;
+
+    #[derive(Debug)]
+    /// MCP consensus payload column.
+    ///
+    /// Stores the aggregated consensus payload (certificates, votes)
+    /// separately from proposer transaction data.
+    ///
+    /// * index type: `(Slot, block_id: Hash)`
+    /// * value type: `Vec<u8>` (serialized consensus payload)
+    pub struct McpConsensusPayload;
+
+    #[derive(Debug)]
+    /// MCP execution output column.
+    ///
+    /// Stores the deterministic execution output for each slot,
+    /// which is the ordered concatenation of all proposer batches.
+    ///
+    /// * index type: `(Slot, block_id: Hash)`
+    /// * value type: `Vec<u8>` (serialized execution output)
+    pub struct McpExecutionOutput;
 }
 
 macro_rules! convert_column_index_to_key_bytes {
@@ -1158,4 +1238,291 @@ impl ColumnName for columns::DoubleMerkleMeta {
 
 impl TypedColumn for columns::DoubleMerkleMeta {
     type Type = blockstore_meta::DoubleMerkleMeta;
+}
+
+// =============================================================================
+// MCP (Multiple Concurrent Proposers) column implementations
+// =============================================================================
+
+/// MCP proposer ID type
+pub type McpProposerId = u8;
+
+// McpShredData: (Slot, proposer_id: u8, shred_index: u64)
+impl Column for columns::McpShredData {
+    type Index = (Slot, McpProposerId, /*shred_index:*/ u64);
+    type Key = [u8; std::mem::size_of::<Slot>() + std::mem::size_of::<McpProposerId>() + std::mem::size_of::<u64>()];
+
+    #[inline]
+    fn key((slot, proposer_id, shred_index): &Self::Index) -> Self::Key {
+        let mut key = [0u8; 17]; // 8 + 1 + 8
+        key[0..8].copy_from_slice(&slot.to_be_bytes());
+        key[8] = *proposer_id;
+        key[9..17].copy_from_slice(&shred_index.to_be_bytes());
+        key
+    }
+
+    fn index(key: &[u8]) -> Self::Index {
+        let slot = Slot::from_be_bytes(key[0..8].try_into().unwrap());
+        let proposer_id = key[8];
+        let shred_index = u64::from_be_bytes(key[9..17].try_into().unwrap());
+        (slot, proposer_id, shred_index)
+    }
+
+    fn slot(index: Self::Index) -> Slot {
+        index.0
+    }
+
+    fn as_index(slot: Slot) -> Self::Index {
+        (slot, 0, 0)
+    }
+}
+
+impl ColumnName for columns::McpShredData {
+    const NAME: &'static str = "mcp_data_shred";
+}
+
+// McpShredCode: (Slot, proposer_id: u8, shred_index: u64)
+impl Column for columns::McpShredCode {
+    type Index = (Slot, McpProposerId, /*shred_index:*/ u64);
+    type Key = [u8; std::mem::size_of::<Slot>() + std::mem::size_of::<McpProposerId>() + std::mem::size_of::<u64>()];
+
+    #[inline]
+    fn key((slot, proposer_id, shred_index): &Self::Index) -> Self::Key {
+        let mut key = [0u8; 17]; // 8 + 1 + 8
+        key[0..8].copy_from_slice(&slot.to_be_bytes());
+        key[8] = *proposer_id;
+        key[9..17].copy_from_slice(&shred_index.to_be_bytes());
+        key
+    }
+
+    fn index(key: &[u8]) -> Self::Index {
+        let slot = Slot::from_be_bytes(key[0..8].try_into().unwrap());
+        let proposer_id = key[8];
+        let shred_index = u64::from_be_bytes(key[9..17].try_into().unwrap());
+        (slot, proposer_id, shred_index)
+    }
+
+    fn slot(index: Self::Index) -> Slot {
+        index.0
+    }
+
+    fn as_index(slot: Slot) -> Self::Index {
+        (slot, 0, 0)
+    }
+}
+
+impl ColumnName for columns::McpShredCode {
+    const NAME: &'static str = "mcp_code_shred";
+}
+
+// McpSlotMeta: (Slot, proposer_id: u8)
+impl Column for columns::McpSlotMeta {
+    type Index = (Slot, McpProposerId);
+    type Key = [u8; std::mem::size_of::<Slot>() + std::mem::size_of::<McpProposerId>()];
+
+    #[inline]
+    fn key((slot, proposer_id): &Self::Index) -> Self::Key {
+        let mut key = [0u8; 9]; // 8 + 1
+        key[0..8].copy_from_slice(&slot.to_be_bytes());
+        key[8] = *proposer_id;
+        key
+    }
+
+    fn index(key: &[u8]) -> Self::Index {
+        let slot = Slot::from_be_bytes(key[0..8].try_into().unwrap());
+        let proposer_id = key[8];
+        (slot, proposer_id)
+    }
+
+    fn slot(index: Self::Index) -> Slot {
+        index.0
+    }
+
+    fn as_index(slot: Slot) -> Self::Index {
+        (slot, 0)
+    }
+}
+
+impl ColumnName for columns::McpSlotMeta {
+    const NAME: &'static str = "mcp_slot_meta";
+}
+
+impl TypedColumn for columns::McpSlotMeta {
+    type Type = blockstore_meta::SlotMeta;
+}
+
+// McpErasureMeta: (Slot, proposer_id: u8, fec_set_index: u32)
+impl Column for columns::McpErasureMeta {
+    type Index = (Slot, McpProposerId, /*fec_set_index:*/ u32);
+    type Key = [u8; std::mem::size_of::<Slot>() + std::mem::size_of::<McpProposerId>() + std::mem::size_of::<u32>()];
+
+    #[inline]
+    fn key((slot, proposer_id, fec_set_index): &Self::Index) -> Self::Key {
+        let mut key = [0u8; 13]; // 8 + 1 + 4
+        key[0..8].copy_from_slice(&slot.to_be_bytes());
+        key[8] = *proposer_id;
+        key[9..13].copy_from_slice(&fec_set_index.to_be_bytes());
+        key
+    }
+
+    fn index(key: &[u8]) -> Self::Index {
+        let slot = Slot::from_be_bytes(key[0..8].try_into().unwrap());
+        let proposer_id = key[8];
+        let fec_set_index = u32::from_be_bytes(key[9..13].try_into().unwrap());
+        (slot, proposer_id, fec_set_index)
+    }
+
+    fn slot(index: Self::Index) -> Slot {
+        index.0
+    }
+
+    fn as_index(slot: Slot) -> Self::Index {
+        (slot, 0, 0)
+    }
+}
+
+impl ColumnName for columns::McpErasureMeta {
+    const NAME: &'static str = "mcp_erasure_meta";
+}
+
+impl TypedColumn for columns::McpErasureMeta {
+    type Type = blockstore_meta::ErasureMeta;
+}
+
+// McpMerkleRootMeta: (Slot, proposer_id: u8, fec_set_index: u32)
+impl Column for columns::McpMerkleRootMeta {
+    type Index = (Slot, McpProposerId, /*fec_set_index:*/ u32);
+    type Key = [u8; std::mem::size_of::<Slot>() + std::mem::size_of::<McpProposerId>() + std::mem::size_of::<u32>()];
+
+    #[inline]
+    fn key((slot, proposer_id, fec_set_index): &Self::Index) -> Self::Key {
+        let mut key = [0u8; 13]; // 8 + 1 + 4
+        key[0..8].copy_from_slice(&slot.to_be_bytes());
+        key[8] = *proposer_id;
+        key[9..13].copy_from_slice(&fec_set_index.to_be_bytes());
+        key
+    }
+
+    fn index(key: &[u8]) -> Self::Index {
+        let slot = Slot::from_be_bytes(key[0..8].try_into().unwrap());
+        let proposer_id = key[8];
+        let fec_set_index = u32::from_be_bytes(key[9..13].try_into().unwrap());
+        (slot, proposer_id, fec_set_index)
+    }
+
+    fn slot(index: Self::Index) -> Slot {
+        index.0
+    }
+
+    fn as_index(slot: Slot) -> Self::Index {
+        (slot, 0, 0)
+    }
+}
+
+impl ColumnName for columns::McpMerkleRootMeta {
+    const NAME: &'static str = "mcp_merkle_root_meta";
+}
+
+impl TypedColumn for columns::McpMerkleRootMeta {
+    type Type = blockstore_meta::MerkleRootMeta;
+}
+
+// McpIndex: (Slot, proposer_id: u8)
+impl Column for columns::McpIndex {
+    type Index = (Slot, McpProposerId);
+    type Key = [u8; std::mem::size_of::<Slot>() + std::mem::size_of::<McpProposerId>()];
+
+    #[inline]
+    fn key((slot, proposer_id): &Self::Index) -> Self::Key {
+        let mut key = [0u8; 9]; // 8 + 1
+        key[0..8].copy_from_slice(&slot.to_be_bytes());
+        key[8] = *proposer_id;
+        key
+    }
+
+    fn index(key: &[u8]) -> Self::Index {
+        let slot = Slot::from_be_bytes(key[0..8].try_into().unwrap());
+        let proposer_id = key[8];
+        (slot, proposer_id)
+    }
+
+    fn slot(index: Self::Index) -> Slot {
+        index.0
+    }
+
+    fn as_index(slot: Slot) -> Self::Index {
+        (slot, 0)
+    }
+}
+
+impl ColumnName for columns::McpIndex {
+    const NAME: &'static str = "mcp_index";
+}
+
+impl TypedColumn for columns::McpIndex {
+    type Type = blockstore_meta::Index;
+}
+
+// McpConsensusPayload: (Slot, block_id: Hash)
+impl Column for columns::McpConsensusPayload {
+    type Index = (Slot, Hash);
+    type Key = [u8; std::mem::size_of::<Slot>() + HASH_BYTES];
+
+    #[inline]
+    fn key((slot, block_id): &Self::Index) -> Self::Key {
+        let mut key = [0u8; 40]; // 8 + 32
+        key[0..8].copy_from_slice(&slot.to_be_bytes());
+        key[8..40].copy_from_slice(block_id.as_ref());
+        key
+    }
+
+    fn index(key: &[u8]) -> Self::Index {
+        let slot = Slot::from_be_bytes(key[0..8].try_into().unwrap());
+        let block_id = Hash::new_from_array(key[8..40].try_into().unwrap());
+        (slot, block_id)
+    }
+
+    fn slot(index: Self::Index) -> Slot {
+        index.0
+    }
+
+    fn as_index(slot: Slot) -> Self::Index {
+        (slot, Hash::default())
+    }
+}
+
+impl ColumnName for columns::McpConsensusPayload {
+    const NAME: &'static str = "mcp_consensus_payload";
+}
+
+// McpExecutionOutput: (Slot, block_id: Hash)
+impl Column for columns::McpExecutionOutput {
+    type Index = (Slot, Hash);
+    type Key = [u8; std::mem::size_of::<Slot>() + HASH_BYTES];
+
+    #[inline]
+    fn key((slot, block_id): &Self::Index) -> Self::Key {
+        let mut key = [0u8; 40]; // 8 + 32
+        key[0..8].copy_from_slice(&slot.to_be_bytes());
+        key[8..40].copy_from_slice(block_id.as_ref());
+        key
+    }
+
+    fn index(key: &[u8]) -> Self::Index {
+        let slot = Slot::from_be_bytes(key[0..8].try_into().unwrap());
+        let block_id = Hash::new_from_array(key[8..40].try_into().unwrap());
+        (slot, block_id)
+    }
+
+    fn slot(index: Self::Index) -> Slot {
+        index.0
+    }
+
+    fn as_index(slot: Slot) -> Self::Index {
+        (slot, Hash::default())
+    }
+}
+
+impl ColumnName for columns::McpExecutionOutput {
+    const NAME: &'static str = "mcp_execution_output";
 }
