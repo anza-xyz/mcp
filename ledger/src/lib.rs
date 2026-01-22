@@ -26,6 +26,7 @@ pub mod leader_schedule;
 pub mod leader_schedule_cache;
 pub mod leader_schedule_utils;
 pub mod mcp;
+pub mod mcp_attestation;
 pub mod mcp_schedule;
 pub mod mcp_schedule_cache;
 pub mod next_slots_iterator;
