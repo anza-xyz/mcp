@@ -5,6 +5,8 @@
 
 pub mod account_loader;
 pub mod account_overrides;
+pub mod mcp_fee_payer;
+pub mod mcp_fee_replay;
 pub mod message_processor;
 pub mod nonce_info;
 pub mod program_loader;
