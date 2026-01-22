@@ -115,11 +115,11 @@ impl SlotFeePayerTracker {
     /// Check if a payer can commit additional fees without exceeding their limit.
     ///
     /// In MCP, a payer must have enough balance to cover fees from ALL proposers
-    /// that might include their transaction. This function enforces that the
-    /// total commitment doesn't exceed what they can safely pay.
+    /// that might include their transaction. Per spec §13.1, fee payers must
+    /// reserve `NUM_PROPOSERS * total_fee` for each transaction submitted.
     ///
-    /// The limit is `spendable / NUM_PROPOSERS * NUM_PROPOSERS = spendable`,
-    /// but we track to ensure we don't exceed the initial MCP requirement.
+    /// This function enforces that the total MCP-adjusted commitment doesn't
+    /// exceed the payer's spendable balance.
     pub fn can_commit(
         &self,
         payer: &Pubkey,
@@ -128,26 +128,20 @@ impl SlotFeePayerTracker {
         min_balance: u64,
     ) -> Result<(), McpFeePayerError> {
         let current_commitment = self.get_commitment(payer);
-        let new_total = current_commitment.saturating_add(fee);
+
+        // Per spec §13.1: Each transaction requires NUM_PROPOSERS * fee reserved
+        // because it might be included by any of the proposers.
+        let mcp_adjusted_fee = fee.saturating_mul(NUM_PROPOSERS as u64);
+        let new_total = current_commitment.saturating_add(mcp_adjusted_fee);
 
         // The payer's spendable balance after reserving min_balance
         let spendable = available_balance.saturating_sub(min_balance);
 
-        // For MCP, the payer should have initially validated with NUM_PROPOSERS * fee.
-        // The maximum they can commit is their spendable balance, but we enforce
-        // that they can't commit more than NUM_PROPOSERS times the per-tx fee.
-        // This ensures proper coverage even if multiple proposers include them.
-        //
-        // Key insight: A single transaction with fee F can be included by up to
-        // NUM_PROPOSERS proposers. The payer needs F * NUM_PROPOSERS available.
-        // If they submit multiple transactions, each needs its own NUM_PROPOSERS * F.
-        let max_allowed = spendable;
-
-        if new_total > max_allowed {
+        if new_total > spendable {
             return Err(McpFeePayerError::OverCommitted {
                 payer: *payer,
                 committed: new_total,
-                max_allowed,
+                max_allowed: spendable,
             });
         }
 
@@ -274,17 +268,25 @@ mod tests {
         let mut tracker = SlotFeePayerTracker::new(100);
         let payer = Pubkey::new_unique();
 
-        // With 10000 lamports available and 0 min_balance
-        assert!(tracker.can_commit(&payer, 5000, 10000, 0).is_ok());
+        // With NUM_PROPOSERS (16) proposers, committing fee F requires 16*F available.
+        // So with 160000 lamports, we can commit one tx with fee=10000 (16*10000=160000)
+        let balance = 160_000u64;
+        let fee = 10_000u64;
 
-        // Add a commitment
-        tracker.add_commitment(payer, 5000);
+        // First tx should be allowed (requires 16 * 10000 = 160000)
+        assert!(tracker.can_commit(&payer, fee, balance, 0).is_ok());
 
-        // Now we have 5000 committed, can commit 5000 more
-        assert!(tracker.can_commit(&payer, 5000, 10000, 0).is_ok());
+        // Add the MCP-adjusted commitment (16 * fee)
+        let mcp_fee = fee * NUM_PROPOSERS as u64;
+        tracker.add_commitment(payer, mcp_fee);
 
-        // But not 5001 more
-        assert!(tracker.can_commit(&payer, 5001, 10000, 0).is_err());
+        // Now we have 160000 committed and 160000 available - can't commit more
+        assert!(tracker.can_commit(&payer, 1, balance, 0).is_err());
+
+        // With more balance, we can commit more
+        let bigger_balance = 320_000u64;
+        let tracker2 = SlotFeePayerTracker::new(100);
+        assert!(tracker2.can_commit(&payer, fee, bigger_balance, 0).is_ok());
     }
 
     #[test]

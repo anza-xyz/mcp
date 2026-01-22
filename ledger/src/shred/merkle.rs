@@ -196,8 +196,9 @@ impl ShredData {
             },
         );
         // Shred index in the erasure batch.
+        // MCP-05: fec_set_index offset updated from 79 to 80 due to proposer_id field.
         let index = {
-            let fec_set_index = <[u8; 4]>::try_from(shred.get(79..83)?)
+            let fec_set_index = <[u8; 4]>::try_from(shred.get(80..84)?)
                 .map(u32::from_le_bytes)
                 .ok()?;
             shred::layout::get_index(shred)?
@@ -252,12 +253,14 @@ impl ShredCode {
             },
         );
         // Shred index in the erasure batch.
+        // MCP-05: offsets updated due to proposer_id field:
+        //   num_data_shreds: 83->84, position: 87->88
         let index = {
-            let num_data_shreds = <[u8; 2]>::try_from(shred.get(83..85)?)
+            let num_data_shreds = <[u8; 2]>::try_from(shred.get(84..86)?)
                 .map(u16::from_le_bytes)
                 .map(usize::from)
                 .ok()?;
-            let position = <[u8; 2]>::try_from(shred.get(87..89)?)
+            let position = <[u8; 2]>::try_from(shred.get(88..90)?)
                 .map(u16::from_le_bytes)
                 .map(usize::from)
                 .ok()?;

@@ -24,6 +24,18 @@ use {
 // Re-export MCP constants from canonical source (ledger/src/mcp.rs)
 pub use solana_ledger::mcp::{NUM_PROPOSERS, NUM_RELAYS};
 
+/// Maximum witness entries (merkle proof depth for 256 leaves)
+pub const MAX_WITNESS_ENTRIES: usize = 8;
+
+/// Size of each witness entry (truncated hash)
+pub const WITNESS_ENTRY_SIZE: usize = 20;
+
+/// Maximum witness bytes (8 entries * 20 bytes)
+pub const MAX_WITNESS_BYTES: usize = MAX_WITNESS_ENTRIES * WITNESS_ENTRY_SIZE;
+
+/// Maximum shred index (200 shreds per FEC block, indices 0-199)
+pub const MAX_SHRED_INDEX: u32 = 199;
+
 /// Result of validating a proposer shred.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ShredValidationResult {
@@ -228,42 +240,61 @@ impl RelayShredProcessor {
     /// The shred_index is taken from the message itself. The relay verifies
     /// that this shred is meant for them by checking
     /// `message.shred_index % NUM_RELAYS == relay_id`.
+    ///
+    /// Per spec §9.1, verification failures result in silent drop (return None).
     pub fn process_shred(
         &mut self,
         message: &ProposerShredMessage,
         proposer_pubkey: &Pubkey,
-    ) -> (ShredValidationResult, Option<ValidatedShred>) {
+    ) -> Option<ValidatedShred> {
         let shred_index = message.shred_index;
 
-        // Validate proposer ID
+        // Validate proposer ID (must be in range [0, 15])
+        // Per spec: silently drop if invalid
         if message.proposer_id >= NUM_PROPOSERS {
-            return (ShredValidationResult::InvalidProposerId, None);
+            return None;
+        }
+
+        // Validate shred_index (must be in range [0, 199])
+        // Per spec: silently drop if invalid
+        if shred_index > MAX_SHRED_INDEX {
+            return None;
+        }
+
+        // Validate witness length (must be <= MAX_WITNESS_BYTES = 160)
+        // Per spec §9.1: silently drop if exceeded
+        if message.witness.len() > MAX_WITNESS_BYTES {
+            return None;
         }
 
         // Verify this shred is meant for this relay
         // In MCP, relay_id = shred_index % NUM_RELAYS
+        // Per spec: silently drop if wrong relay
         let expected_relay = (shred_index as u16) % NUM_RELAYS;
         if expected_relay != self.relay_id {
-            return (ShredValidationResult::WrongRelayIndex, None);
+            return None;
         }
 
         // Verify proposer signature
         // Note: signature binds (slot, proposer_id, shred_index, commitment)
+        // Per spec: silently drop if signature verification fails
         if !message.verify_proposer_signature(proposer_pubkey) {
-            return (ShredValidationResult::InvalidSignature, None);
+            return None;
         }
 
         // Verify merkle proof
         // The witness should prove that the shred is at shred_index
         // in the merkle tree committed to by the proposer
+        // Per spec: silently drop if merkle proof fails
         if !self.verify_merkle_witness(message, shred_index) {
-            return (ShredValidationResult::InvalidMerkleProof, None);
+            return None;
         }
 
         // Check for duplicate
+        // Per spec: silently drop duplicate (keep first received)
         if let Some(tracker) = self.slot_trackers.get(&message.slot) {
             if tracker.has_shred(message.proposer_id, shred_index) {
-                return (ShredValidationResult::Duplicate, None);
+                return None;
             }
         }
 
@@ -285,7 +316,7 @@ impl RelayShredProcessor {
         // Cleanup old slots if needed
         self.cleanup_old_slots(message.slot);
 
-        (ShredValidationResult::Valid, Some(validated))
+        Some(validated)
     }
 
     /// Verify the merkle witness for a shred.
@@ -420,8 +451,50 @@ mod tests {
             Signature::default(),
         );
 
-        let (result, _) = processor.process_shred(&msg, &Pubkey::new_unique());
-        assert_eq!(result, ShredValidationResult::InvalidProposerId);
+        // Per spec: silently drop invalid proposer_id
+        let result = processor.process_shred(&msg, &Pubkey::new_unique());
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_relay_processor_witness_too_long() {
+        let mut processor = RelayShredProcessor::new(0);
+
+        // Create witness larger than MAX_WITNESS_BYTES (160)
+        let oversized_witness = vec![0u8; MAX_WITNESS_BYTES + 1];
+
+        let msg = ProposerShredMessage::new(
+            100,
+            5,
+            0, // shred_index 0 maps to relay 0
+            make_test_hash(1),
+            vec![1, 2, 3],
+            oversized_witness,
+            Signature::default(),
+        );
+
+        // Per spec: silently drop if witness_len > 8 entries
+        let result = processor.process_shred(&msg, &Pubkey::new_unique());
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_relay_processor_invalid_shred_index() {
+        let mut processor = RelayShredProcessor::new(0);
+
+        let msg = ProposerShredMessage::new(
+            100,
+            5,
+            200, // Invalid: > MAX_SHRED_INDEX (199)
+            make_test_hash(1),
+            vec![1, 2, 3],
+            vec![],
+            Signature::default(),
+        );
+
+        // Per spec: silently drop invalid shred_index
+        let result = processor.process_shred(&msg, &Pubkey::new_unique());
+        assert!(result.is_none());
     }
 
     #[test]

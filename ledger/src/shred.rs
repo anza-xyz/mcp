@@ -1204,7 +1204,7 @@ mod tests {
             let parent_offset = 0u16;
             {
                 let mut cursor = Cursor::new(packet.buffer_mut());
-                cursor.seek(SeekFrom::Start(83)).unwrap();
+                cursor.seek(SeekFrom::Start(84)).unwrap(); // MCP-05: offset updated from 83 to 84
                 cursor.write_all(&parent_offset.to_le_bytes()).unwrap();
             }
             assert_eq!(
@@ -1225,7 +1225,7 @@ mod tests {
             let parent_offset = u16::try_from(slot + 1).unwrap();
             {
                 let mut cursor = Cursor::new(packet.buffer_mut());
-                cursor.seek(SeekFrom::Start(83)).unwrap();
+                cursor.seek(SeekFrom::Start(84)).unwrap(); // MCP-05: offset updated from 83 to 84
                 cursor.write_all(&parent_offset.to_le_bytes()).unwrap();
             }
             assert_eq!(

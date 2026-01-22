@@ -44,6 +44,8 @@ pub struct BanklessBatch {
     pub transactions: Vec<Vec<u8>>,
     /// Transaction hashes for deduplication.
     pub transaction_hashes: Vec<Hash>,
+    /// Ordering fees for deterministic sorting.
+    ordering_fees: Vec<u64>,
     /// Total size in bytes.
     pub total_bytes: usize,
 }
@@ -56,30 +58,92 @@ impl BanklessBatch {
             proposer_id,
             transactions: Vec::new(),
             transaction_hashes: Vec::new(),
+            ordering_fees: Vec::new(),
             total_bytes: 0,
         }
     }
 
-    /// Add a transaction to the batch.
+    /// Add a transaction to the batch with ordering fee.
+    ///
+    /// The ordering_fee is used to sort transactions before serialization
+    /// (higher fee = earlier in batch, per spec §8.1).
     ///
     /// Returns the recording status.
-    pub fn add_transaction(&mut self, tx_data: Vec<u8>, tx_hash: Hash) -> RecordingStatus {
+    pub fn add_transaction_with_fee(
+        &mut self,
+        tx_data: Vec<u8>,
+        tx_hash: Hash,
+        ordering_fee: u64,
+    ) -> RecordingStatus {
         // Check for duplicate
         if self.transaction_hashes.contains(&tx_hash) {
             return RecordingStatus::Duplicate;
         }
 
-        // Check size limit
-        const MAX_BATCH_SIZE: usize = 1024 * 1024; // 1 MB
-        if self.total_bytes + tx_data.len() > MAX_BATCH_SIZE {
+        // Check size limit (per spec §2.5: MAX_PROPOSER_PAYLOAD_BYTES = 38,080)
+        if self.total_bytes + tx_data.len() > Self::MAX_BATCH_SIZE {
+            return RecordingStatus::TooLarge;
+        }
+
+        // Check transaction count limit (per spec §2.5: 65,536)
+        if self.transactions.len() >= Self::MAX_TRANSACTIONS_PER_BATCH {
+            return RecordingStatus::TooLarge;
+        }
+
+        // Check individual transaction size (per spec §2.5: MAX_TX_SIZE = 4,096)
+        if tx_data.len() > Self::MAX_TRANSACTION_SIZE {
             return RecordingStatus::TooLarge;
         }
 
         self.total_bytes += tx_data.len();
         self.transactions.push(tx_data);
         self.transaction_hashes.push(tx_hash);
+        self.ordering_fees.push(ordering_fee);
 
         RecordingStatus::Recorded
+    }
+
+    /// Add a transaction to the batch (with zero ordering fee).
+    ///
+    /// Returns the recording status.
+    pub fn add_transaction(&mut self, tx_data: Vec<u8>, tx_hash: Hash) -> RecordingStatus {
+        self.add_transaction_with_fee(tx_data, tx_hash, 0)
+    }
+
+    /// Sort transactions for serialization.
+    ///
+    /// Per spec §8.1: Order by ordering_fee descending, then by
+    /// SHA256(serialized_transaction) ascending for determinism.
+    pub fn sort_for_serialization(&mut self) {
+        // Create indices for sorting
+        let mut indices: Vec<usize> = (0..self.transactions.len()).collect();
+
+        // Sort by: ordering_fee DESC, then tx_hash ASC
+        indices.sort_by(|&a, &b| {
+            let fee_a = self.ordering_fees.get(a).copied().unwrap_or(0);
+            let fee_b = self.ordering_fees.get(b).copied().unwrap_or(0);
+
+            // First compare by ordering_fee descending
+            match fee_b.cmp(&fee_a) {
+                std::cmp::Ordering::Equal => {
+                    // Then by tx_hash ascending (for determinism)
+                    self.transaction_hashes[a].cmp(&self.transaction_hashes[b])
+                }
+                other => other,
+            }
+        });
+
+        // Reorder all vectors according to sorted indices
+        let transactions: Vec<_> = indices.iter().map(|&i| self.transactions[i].clone()).collect();
+        let hashes: Vec<_> = indices.iter().map(|&i| self.transaction_hashes[i]).collect();
+        let fees: Vec<_> = indices
+            .iter()
+            .map(|&i| self.ordering_fees.get(i).copied().unwrap_or(0))
+            .collect();
+
+        self.transactions = transactions;
+        self.transaction_hashes = hashes;
+        self.ordering_fees = fees;
     }
 
     /// Get the number of transactions.
@@ -93,6 +157,9 @@ impl BanklessBatch {
     }
 
     /// Serialize the batch for shredding.
+    ///
+    /// Note: Call `sort_for_serialization()` before this to ensure
+    /// deterministic ordering per spec §8.1.
     pub fn serialize(&self) -> Vec<u8> {
         let mut data = Vec::new();
 
@@ -101,7 +168,7 @@ impl BanklessBatch {
         data.push(self.proposer_id);
         data.extend_from_slice(&(self.transactions.len() as u32).to_le_bytes());
 
-        // Transactions
+        // Transactions (already sorted by caller via sort_for_serialization)
         for tx in &self.transactions {
             data.extend_from_slice(&(tx.len() as u32).to_le_bytes());
             data.extend_from_slice(tx);
@@ -110,14 +177,23 @@ impl BanklessBatch {
         data
     }
 
-    /// Maximum number of transactions allowed in a batch (safety limit).
-    const MAX_TRANSACTIONS_PER_BATCH: usize = 10_000;
+    /// Serialize the batch with automatic sorting.
+    ///
+    /// Per spec §8.1: Orders by ordering_fee descending, then tx hash ascending.
+    pub fn serialize_sorted(&mut self) -> Vec<u8> {
+        self.sort_for_serialization();
+        self.serialize()
+    }
 
-    /// Maximum size of a single transaction in bytes (safety limit).
-    const MAX_TRANSACTION_SIZE: usize = 1_232; // MTU-based limit
+    /// Maximum number of transactions allowed in a batch (per spec §2.5).
+    pub const MAX_TRANSACTIONS_PER_BATCH: usize = 65_536;
 
-    /// Maximum total batch size in bytes (safety limit).
-    const MAX_BATCH_SIZE: usize = 16 * 1024 * 1024; // 16 MB
+    /// Maximum size of a single transaction in bytes (per spec §2.5).
+    pub const MAX_TRANSACTION_SIZE: usize = 4_096; // MAX_TX_SIZE per spec
+
+    /// Maximum total batch size in bytes (per spec §2.5).
+    /// K_DATA_SHREDS (40) × MCP_SHRED_PAYLOAD_BYTES (952) = 38,080
+    pub const MAX_BATCH_SIZE: usize = 38_080; // MAX_PROPOSER_PAYLOAD_BYTES
 
     /// Deserialize a batch with bounds checking to prevent memory DoS.
     pub fn deserialize(data: &[u8]) -> Option<Self> {
@@ -198,8 +274,8 @@ pub struct BanklessConfig {
 impl Default for BanklessConfig {
     fn default() -> Self {
         Self {
-            max_batch_size: 1024 * 1024, // 1 MB
-            max_transactions: 10_000,
+            max_batch_size: BanklessBatch::MAX_BATCH_SIZE,       // 38,080 per spec
+            max_transactions: BanklessBatch::MAX_TRANSACTIONS_PER_BATCH, // 65,536 per spec
             verify_signatures: true,
         }
     }

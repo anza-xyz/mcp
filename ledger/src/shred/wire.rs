@@ -200,11 +200,12 @@ pub(crate) fn get_signed_data(shred: &[u8]) -> Option<Hash> {
     Some(data)
 }
 
+// MCP-05: Offset updated from 85 to 86 due to proposer_id field.
 pub fn get_reference_tick(shred: &[u8]) -> Result<u8, Error> {
     if get_shred_type(shred)? != ShredType::Data {
         return Err(Error::InvalidShredType);
     }
-    let Some(flags) = shred.get(85) else {
+    let Some(flags) = shred.get(86) else {
         return Err(Error::InvalidPayloadSize(shred.len()));
     };
     Ok(flags & ShredFlags::SHRED_TICK_REFERENCE_MASK.bits())

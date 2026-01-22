@@ -296,6 +296,8 @@ pub struct AttestationAggregator {
     relay_attestations: HashMap<u16, AttestationMessage>,
     /// Maps relay_id to their stake.
     relay_stakes: HashMap<u16, u64>,
+    /// Maps relay_id to their pubkey for signature verification.
+    relay_pubkeys: HashMap<u16, Pubkey>,
     /// Total stake of all relays.
     total_stake: u64,
     /// Detected equivocations.
@@ -306,21 +308,35 @@ pub struct AttestationAggregator {
 
 impl AttestationAggregator {
     /// Create a new aggregator for a slot.
-    pub fn new(slot: u64, relay_stakes: HashMap<u16, u64>) -> Self {
+    ///
+    /// # Arguments
+    ///
+    /// * `slot` - The slot being aggregated
+    /// * `relay_stakes` - Maps relay_id to their stake
+    /// * `relay_pubkeys` - Maps relay_id to their pubkey for signature verification
+    pub fn new(
+        slot: u64,
+        relay_stakes: HashMap<u16, u64>,
+        relay_pubkeys: HashMap<u16, Pubkey>,
+    ) -> Self {
         let total_stake = relay_stakes.values().sum();
         Self {
             slot,
             relay_attestations: HashMap::new(),
             relay_stakes,
+            relay_pubkeys,
             total_stake,
             equivocations: Vec::new(),
             dropped_relays: HashSet::new(),
         }
     }
 
-    /// Add a verified attestation from a relay.
+    /// Add an attestation from a relay after verifying its signature.
     ///
-    /// Returns any equivocation detected.
+    /// Returns any equivocation detected. Returns None if:
+    /// - Slot doesn't match
+    /// - Relay pubkey is unknown
+    /// - Signature verification fails
     pub fn add_attestation(
         &mut self,
         attestation: AttestationMessage,
@@ -330,6 +346,16 @@ impl AttestationAggregator {
         }
 
         let relay_id = attestation.relay_id;
+
+        // Per spec: verify relay signature before processing
+        let relay_pubkey = match self.relay_pubkeys.get(&relay_id) {
+            Some(pubkey) => pubkey,
+            None => return None, // Unknown relay
+        };
+
+        if !attestation.verify(relay_pubkey) {
+            return None; // Invalid signature
+        }
 
         // Check for equivocation with previous attestation
         if let Some(prev) = self.relay_attestations.get(&relay_id) {
@@ -487,22 +513,26 @@ mod tests {
 
     #[test]
     fn test_attestation_aggregator() {
-        let mut stakes = HashMap::new();
-        stakes.insert(0u16, 100);
-        stakes.insert(1u16, 100);
-        stakes.insert(2u16, 100);
+        // Create keypairs for each relay first
+        let keypairs: Vec<Keypair> = (0..3).map(|_| Keypair::new()).collect();
 
-        let mut aggregator = AttestationAggregator::new(100, stakes);
+        let mut stakes = HashMap::new();
+        let mut pubkeys = HashMap::new();
+        for (relay_id, keypair) in keypairs.iter().enumerate() {
+            stakes.insert(relay_id as u16, 100);
+            pubkeys.insert(relay_id as u16, keypair.pubkey());
+        }
+
+        let mut aggregator = AttestationAggregator::new(100, stakes, pubkeys);
 
         // Add attestations from three relays
-        for relay_id in 0..3 {
-            let keypair = Keypair::new();
+        for (relay_id, keypair) in keypairs.iter().enumerate() {
             let entries = vec![
                 AttestationEntry::new(1, make_test_hash(1)),
                 AttestationEntry::new(2, make_test_hash(2)),
             ];
-            let mut msg = AttestationMessage::new(100, relay_id, entries);
-            msg.sign(&keypair);
+            let mut msg = AttestationMessage::new(100, relay_id as u16, entries);
+            msg.sign(keypair);
             aggregator.add_attestation(msg);
         }
 
@@ -517,12 +547,15 @@ mod tests {
 
     #[test]
     fn test_equivocation_detection() {
+        let keypair = Keypair::new();
+
         let mut stakes = HashMap::new();
         stakes.insert(0u16, 100);
 
-        let mut aggregator = AttestationAggregator::new(100, stakes);
+        let mut pubkeys = HashMap::new();
+        pubkeys.insert(0u16, keypair.pubkey());
 
-        let keypair = Keypair::new();
+        let mut aggregator = AttestationAggregator::new(100, stakes, pubkeys);
 
         // First attestation
         let entries1 = vec![AttestationEntry::new(1, make_test_hash(1))];
@@ -538,5 +571,49 @@ mod tests {
 
         assert_eq!(aggregator.equivocations().len(), 1);
         assert_eq!(aggregator.attestation_count(), 0); // Relay was dropped
+    }
+
+    #[test]
+    fn test_invalid_signature_rejected() {
+        let keypair = Keypair::new();
+        let wrong_keypair = Keypair::new();
+
+        let mut stakes = HashMap::new();
+        stakes.insert(0u16, 100);
+
+        let mut pubkeys = HashMap::new();
+        pubkeys.insert(0u16, keypair.pubkey()); // Register correct pubkey
+
+        let mut aggregator = AttestationAggregator::new(100, stakes, pubkeys);
+
+        // Create attestation signed with wrong key
+        let entries = vec![AttestationEntry::new(1, make_test_hash(1))];
+        let mut msg = AttestationMessage::new(100, 0, entries);
+        msg.sign(&wrong_keypair); // Sign with wrong key
+
+        // Should be rejected (returns None without adding)
+        assert!(aggregator.add_attestation(msg).is_none());
+        assert_eq!(aggregator.attestation_count(), 0);
+    }
+
+    #[test]
+    fn test_unknown_relay_rejected() {
+        let keypair = Keypair::new();
+
+        let mut stakes = HashMap::new();
+        stakes.insert(0u16, 100);
+
+        let mut pubkeys = HashMap::new();
+        // Don't register relay 0's pubkey
+
+        let mut aggregator = AttestationAggregator::new(100, stakes, pubkeys);
+
+        let entries = vec![AttestationEntry::new(1, make_test_hash(1))];
+        let mut msg = AttestationMessage::new(100, 0, entries);
+        msg.sign(&keypair);
+
+        // Should be rejected (unknown relay)
+        assert!(aggregator.add_attestation(msg).is_none());
+        assert_eq!(aggregator.attestation_count(), 0);
     }
 }

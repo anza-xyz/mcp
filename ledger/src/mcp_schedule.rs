@@ -56,14 +56,13 @@ impl ProposerSchedule {
         epoch: Epoch,
         num_slots: u64,
     ) -> Self {
-        // Build pool as a single weighted shuffle (no duplicates).
-        // Use modular indexing for slot extraction to avoid boundary issues.
+        // Build pool with exactly NUM_PROPOSERS validators (per spec §3.3).
+        // Use modular indexing for slot extraction to guarantee uniqueness.
         let proposer_pool = stake_weighted_selection(
             keyed_stakes,
             epoch,
-            // Pool size is one complete shuffle of validators
-            0, // 0 means "use validators.len()"
-            0x50524F50, // "PROP" magic for proposer RNG differentiation
+            NUM_PROPOSERS as u64, // Pool size equals role count per spec
+            0x50524F50,           // "PROP" magic for proposer RNG differentiation
         );
 
         let pubkey_to_positions = build_position_map(&proposer_pool);
@@ -171,14 +170,13 @@ impl RelaySchedule {
         epoch: Epoch,
         num_slots: u64,
     ) -> Self {
-        // Build pool as a single weighted shuffle (no duplicates).
-        // Use modular indexing for slot extraction to avoid boundary issues.
+        // Build pool with exactly NUM_RELAYS validators (per spec §3.3).
+        // Use modular indexing for slot extraction to guarantee uniqueness.
         let relay_pool = stake_weighted_selection(
             keyed_stakes,
             epoch,
-            // Pool size is one complete shuffle of validators
-            0, // 0 means "use validators.len()"
-            0x52454C59, // "RELY" magic for relay RNG differentiation
+            NUM_RELAYS as u64, // Pool size equals role count per spec
+            0x52454C59,        // "RELY" magic for relay RNG differentiation
         );
 
         let pubkey_to_positions = build_position_map(&relay_pool);
