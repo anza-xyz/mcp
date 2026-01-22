@@ -28,6 +28,7 @@ pub mod fetch_stage;
 pub mod forwarding_stage;
 pub mod gen_keys;
 pub mod mcp_attestation_service;
+pub mod mcp_replay;
 pub mod next_leader;
 pub mod optimistic_confirmation_verifier;
 pub mod repair;
