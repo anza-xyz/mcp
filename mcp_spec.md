@@ -1,7 +1,7 @@
 # MCP (Multiple Concurrent Proposers) Protocol Specification
 
-**Version:** 1.0
-**Status:** Implementation Complete
+**Version:** 1.0-draft
+**Status:** Draft (structures defined, integration incomplete)
 
 ## Table of Contents
 
@@ -97,17 +97,19 @@ The FEC rate (40:160) provides 4:1 redundancy, allowing reconstruction from any 
 
 ### 3.2 Schedule Generation
 
-Schedules are deterministically generated per epoch using stake-weighted selection:
+Schedules are deterministically generated per epoch using stake-weighted selection **without replacement** to ensure unique validators per slot:
 
 ```
-seed = hash(epoch_number)
+seed = hash(epoch_number || role_magic)
 rng = ChaCha20Rng::from_seed(seed)
-schedule = stake_weighted_shuffle(validators, stakes, rng)
+schedule = stake_weighted_sample_without_replacement(validators, stakes, rng, pool_size)
 ```
 
-**Proposer Schedule:** First 16 validators from shuffled list, rotating one position per slot.
+**Proposer Schedule:** 16 unique validators selected stake-weighted, rotating one position per slot.
 
-**Relay Schedule:** First 200 validators from shuffled list, rotating one position per slot.
+**Relay Schedule:** 200 unique validators selected stake-weighted, rotating one position per slot.
+
+**Note:** The selection algorithm MUST ensure no duplicate validators within a single slot's proposer or relay set.
 
 **Leader Schedule:** Unchanged from standard Solana; uses `NUM_CONSECUTIVE_LEADER_SLOTS` repetition.
 
@@ -203,6 +205,8 @@ struct ConsensusPayload {
 
 ### 5.1 Common Header (MCP Extended)
 
+Total size: **84 bytes** (legacy: 83 bytes without proposer_id)
+
 ```
 ┌──────────────────┬───────────────────────────────────────────────┐
 │ Offset (bytes)   │ Field                                         │
@@ -238,18 +242,20 @@ struct ConsensusPayload {
 
 ### 6.1 MCP Transaction Config
 
-Extended transaction configuration with MCP-specific fees:
+Extended transaction configuration with MCP-specific fees. Fields are serialized in mask order (variable-length encoding).
 
 ```
 ┌──────────────────┬───────────────────────────────────────────────┐
-│ Offset           │ Field                                         │
+│ Field            │ Size (if present)                             │
 ├──────────────────┼───────────────────────────────────────────────┤
-│ 0                │ config_mask (1 byte)                          │
-│ 1-8              │ inclusion_fee (8 bytes, optional)             │
-│ 9-16             │ ordering_fee (8 bytes, optional)              │
-│ 17-48            │ target_proposer (32 bytes, optional)          │
+│ config_mask      │ 1 byte (always present)                       │
+│ inclusion_fee    │ 8 bytes, little-endian (if bit 0x01 set)      │
+│ ordering_fee     │ 8 bytes, little-endian (if bit 0x02 set)      │
+│ target_proposer  │ 32 bytes, pubkey (if bit 0x04 set)            │
 └──────────────────┴───────────────────────────────────────────────┘
 ```
+
+**Note:** Offsets are variable depending on which bits are set. Only present fields are serialized, in the order shown.
 
 ### 6.2 Config Mask Bits
 
@@ -261,12 +267,14 @@ Extended transaction configuration with MCP-specific fees:
 
 ### 6.3 Fee Types
 
-| Fee Type | Description | Charged When |
-|----------|-------------|--------------|
-| signature_fee | Standard signature verification | Always |
-| prioritization_fee | Execution priority | On execution |
-| inclusion_fee | Data availability compensation | Always (regardless of execution) |
-| ordering_fee | Priority within proposer batch | On execution |
+All fees are charged upfront in the fee phase before execution. This ensures proposers are compensated even if execution fails.
+
+| Fee Type | Description | Recipient |
+|----------|-------------|-----------|
+| signature_fee | Standard signature verification | Validator |
+| prioritization_fee | Execution priority | Validator |
+| inclusion_fee | Data availability compensation | Proposer |
+| ordering_fee | Priority within proposer batch | Proposer |
 
 ---
 
@@ -278,7 +286,7 @@ Proposers create transaction batches without executing:
 
 1. Receive transactions from mempool
 2. Validate signatures (no state execution)
-3. Order by ordering_fee descending, then arrival time
+3. Order by ordering_fee descending, then by transaction hash (for determinism)
 4. Serialize batch:
    ```
    | slot (8) | proposer_id (1) | tx_count (4) | [tx_len (4) | tx_data]... |
@@ -293,7 +301,15 @@ Proposers create transaction batches without executing:
 
 ### 7.3 Distribution to Relays
 
-Send to each relay via unicast:
+**Relay Assignment:** Each relay receives one shred per FEC block. The mapping is:
+
+```
+relay_id = shred_index % NUM_RELAYS
+```
+
+Where `shred_index` is in range [0, 199] for MCP FEC blocks.
+
+**Message Format:** Send to each relay via unicast:
 
 ```
 ┌──────────────────────────────────────────────────────────────────┐
@@ -305,7 +321,7 @@ Send to each relay via unicast:
 │ shred_data_len   │ 4 bytes, little-endian                        │
 │ shred_data       │ Variable                                      │
 │ witness_len      │ 2 bytes, little-endian                        │
-│ witness          │ Variable (merkle proof)                       │
+│ witness          │ Variable (merkle proof, max 8 entries)        │
 │ proposer_sig     │ 64 bytes                                      │
 └──────────────────┴───────────────────────────────────────────────┘
 ```
@@ -359,7 +375,23 @@ For each slot:
 block_id = SHA256(canonical_aggregate_bytes)
 ```
 
-Where `canonical_aggregate_bytes` is deterministically serialized aggregate data.
+**Canonical Aggregate Serialization:**
+
+```
+| version (1) | slot (8) | leader_id (32) | aggregate | consensus_meta | delayed_bankhash (32) |
+```
+
+Where `aggregate` is serialized as:
+```
+| num_proposers (1) | [proposer_id (1) | merkle_root (32) | relay_count (2) | stake (8)]... | total_stake (8) |
+```
+
+And `consensus_meta` is:
+```
+| timestamp (8) | parent_block_id (32) | epoch (8) |
+```
+
+All multi-byte integers are little-endian. The signature is NOT included in block_id computation.
 
 ### 9.3 Consensus Payload Broadcast
 
@@ -447,7 +479,7 @@ When consensus produces null result (⊥):
 
 ### 12.1 Fee Payer Requirements
 
-To prevent DA fee payer attacks, fee payers MUST have:
+To prevent DA fee payer attacks, fee payers MUST have sufficient balance for worst-case inclusion across all proposers:
 
 | Account Type | Required Balance |
 |--------------|-----------------|
@@ -456,14 +488,20 @@ To prevent DA fee payer attacks, fee payers MUST have:
 
 Where `total_fee = signature_fee + prioritization_fee + inclusion_fee + ordering_fee`
 
-### 12.2 Fee Distribution
+**Rationale:** A transaction may be included by multiple proposers (up to all 16) in the same slot. The fee payer must be able to cover fees in all cases to prevent griefing attacks where users submit to multiple proposers with insufficient funds.
 
-| Fee Type | Recipient | Timing |
-|----------|-----------|--------|
-| signature_fee | Validator rewards | On finalization |
-| prioritization_fee | Validator rewards | On finalization |
-| inclusion_fee | Proposer | Always (even on failure) |
-| ordering_fee | Proposer | On execution |
+### 12.2 Fee Charging and Distribution
+
+**Charging:** All fees are deducted from the fee payer in the fee phase, before execution. This happens regardless of whether execution succeeds or fails.
+
+**Distribution:**
+
+| Fee Type | Recipient | Notes |
+|----------|-----------|-------|
+| signature_fee | Validator rewards pool | Distributed on slot finalization |
+| prioritization_fee | Validator rewards pool | Distributed on slot finalization |
+| inclusion_fee | Proposer who included tx | Distributed on slot finalization |
+| ordering_fee | Proposer who included tx | Distributed on slot finalization |
 
 ### 12.3 Per-Slot Tracking
 
@@ -621,4 +659,5 @@ The following MUST produce identical results across all implementations:
 
 | Version | Date | Changes |
 |---------|------|---------|
-| 1.0 | 2026-01-22 | Initial specification |
+| 1.0-draft | 2026-01-22 | Initial specification (draft) |
+| 1.0-draft | 2026-01-22 | Corrected fee charging, block_id serialization, relay distribution |
