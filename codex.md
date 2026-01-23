@@ -11,9 +11,9 @@
 - Multiple MCP formats exist in code and disagree with the spec and each other, creating drift risk.
 
 ## Spec Compliance Gaps (with evidence)
-- **Proposer signature message mismatch**: spec signs commitment only (`mcp_spec.md:346-351`), but code signs `slot || proposer_index || commitment` (`ledger/src/shred/mcp_shred.rs:277-289`, `ledger/src/mcp_attestation.rs:97-105`).
+- **Proposer signature message**: FIXED - Code now uses `"mcp:commitment:v1" || commitment32` per spec §5.2 (`ledger/src/shred/mcp_shred.rs:285-289`, `ledger/src/mcp_attestation.rs:103-106`).
 - **MCP shred generation not spec-compliant**: spec requires RS-encoding a payload then constructing `McpShredV1` (`mcp_spec.md:548-557`), but broadcast code repackages existing legacy shreds and their payloads (`turbine/src/broadcast_stage/standard_broadcast_run.rs:658-699`) with no RS encoding.
-- **MCP shred detection is size-only**: spec requires versioned format validation (`mcp_spec.md:361-383`), but detection is `len == 1225` (`ledger/src/shred/mcp_shred.rs:393-396`, `core/src/window_service.rs:214-217`, `turbine/src/sigverify_shreds.rs:905-910`).
+- **MCP shred detection**: FIXED - `is_mcp_shred_packet()` now validates both size (1225 bytes) and witness_len field (must be 8) per spec §6.1 (`ledger/src/shred/mcp_shred.rs:399-406`).
 - **Merkle proof verification**: FIXED - Code now correctly compares full 32-byte root against commitment per spec §4.4.5 (`ledger/src/mcp_merkle.rs:97-130`).
 - **Relay attestation format**: FIXED - All modules now use `proposer_index: u32` consistently (`ledger/src/mcp_attestation.rs:50`, `ledger/src/shred/mcp_shred.rs`, `core/src/mcp_consensus_block.rs`).
 - **Consensus payload type mismatch**: spec defines `AggregateAttestationV1` and block hash rules (`mcp_spec.md:418-618`), while code defines `McpBlockV1` in a separate module and does not wire it into consensus (`core/src/mcp_consensus_block.rs:1-80`).
