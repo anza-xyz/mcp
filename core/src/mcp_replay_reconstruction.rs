@@ -41,82 +41,116 @@ pub enum ReconstructionResult {
     MalformedPayload(String),
 }
 
-/// MCP payload wire format (from spec §5).
+/// MCP payload wire format per spec §5.
 ///
-/// Variable-length payload containing transactions.
-/// Wire format:
-/// - payload_len: u32 (4 bytes) - total payload bytes
-/// - tx_count: u32 (4 bytes) - number of transactions
-/// - tx_len[]: tx_count × u32 (4 bytes each) - length of each tx
-/// - tx_data[]: tx_count × variable - serialized transactions
+/// Wire format (McpPayloadV1):
+/// ```text
+/// | payload_version (1) | slot (8) | proposer_index (4) | payload_len (4) |
+/// | tx_count (2) | TxEntry[tx_count] | reserved (zero-padded) |
+///
+/// TxEntry = | tx_len (2) | tx_bytes[tx_len] |
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct McpPayload {
-    /// Total payload length (excluding header)
+    /// Payload version (must be 1)
+    pub payload_version: u8,
+    /// Slot number
+    pub slot: u64,
+    /// Proposer index [0..NUM_PROPOSERS-1]
+    pub proposer_index: u32,
+    /// Payload body length (bytes after this field)
     pub payload_len: u32,
     /// Number of transactions
-    pub tx_count: u32,
-    /// Transaction lengths
-    pub tx_lengths: Vec<u32>,
+    pub tx_count: u16,
     /// Raw transaction data
     pub tx_data: Vec<Vec<u8>>,
 }
 
 impl McpPayload {
-    /// Create an empty payload
-    pub fn empty() -> Self {
+    /// Create an empty payload for a given slot and proposer
+    pub fn empty(slot: u64, proposer_index: u32) -> Self {
         Self {
-            payload_len: 0,
+            payload_version: 1,
+            slot,
+            proposer_index,
+            payload_len: 2, // just tx_count (2 bytes)
             tx_count: 0,
-            tx_lengths: Vec::new(),
             tx_data: Vec::new(),
         }
     }
 
-    /// Parse payload from raw bytes
+    /// Parse payload from raw bytes per spec §5
     pub fn from_bytes(data: &[u8]) -> io::Result<Self> {
         let mut cursor = std::io::Cursor::new(data);
 
-        // Read payload_len
-        let mut buf = [0u8; 4];
-        cursor.read_exact(&mut buf)?;
-        let payload_len = u32::from_le_bytes(buf);
-
-        // Read tx_count
-        cursor.read_exact(&mut buf)?;
-        let tx_count = u32::from_le_bytes(buf);
-
-        // Read tx_lengths
-        let mut tx_lengths = Vec::with_capacity(tx_count as usize);
-        for _ in 0..tx_count {
-            cursor.read_exact(&mut buf)?;
-            tx_lengths.push(u32::from_le_bytes(buf));
+        // Read payload_version (1 byte)
+        let mut buf1 = [0u8; 1];
+        cursor.read_exact(&mut buf1)?;
+        let payload_version = buf1[0];
+        if payload_version != 1 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("Invalid payload version: {}", payload_version),
+            ));
         }
 
-        // Read tx_data
+        // Read slot (8 bytes)
+        let mut buf8 = [0u8; 8];
+        cursor.read_exact(&mut buf8)?;
+        let slot = u64::from_le_bytes(buf8);
+
+        // Read proposer_index (4 bytes)
+        let mut buf4 = [0u8; 4];
+        cursor.read_exact(&mut buf4)?;
+        let proposer_index = u32::from_le_bytes(buf4);
+
+        // Read payload_len (4 bytes)
+        cursor.read_exact(&mut buf4)?;
+        let payload_len = u32::from_le_bytes(buf4);
+
+        // Read tx_count (2 bytes)
+        let mut buf2 = [0u8; 2];
+        cursor.read_exact(&mut buf2)?;
+        let tx_count = u16::from_le_bytes(buf2);
+
+        // Read TxEntries: each is tx_len (2 bytes) + tx_bytes
         let mut tx_data = Vec::with_capacity(tx_count as usize);
-        for &len in &tx_lengths {
-            let mut tx_bytes = vec![0u8; len as usize];
+        for _ in 0..tx_count {
+            // Read tx_len (2 bytes)
+            cursor.read_exact(&mut buf2)?;
+            let tx_len = u16::from_le_bytes(buf2);
+
+            // Read tx_bytes
+            let mut tx_bytes = vec![0u8; tx_len as usize];
             cursor.read_exact(&mut tx_bytes)?;
             tx_data.push(tx_bytes);
         }
 
         Ok(Self {
+            payload_version,
+            slot,
+            proposer_index,
             payload_len,
             tx_count,
-            tx_lengths,
             tx_data,
         })
     }
 
-    /// Serialize payload to bytes
+    /// Serialize payload to bytes per spec §5
     pub fn to_bytes(&self) -> Vec<u8> {
-        let mut bytes = Vec::new();
-        bytes.extend_from_slice(&self.payload_len.to_le_bytes());
+        // Calculate payload body size: tx_count (2) + sum(2 + tx_len for each tx)
+        let body_len: usize = 2 + self.tx_data.iter().map(|tx| 2 + tx.len()).sum::<usize>();
+
+        let mut bytes = Vec::with_capacity(17 + body_len);
+        bytes.push(self.payload_version);
+        bytes.extend_from_slice(&self.slot.to_le_bytes());
+        bytes.extend_from_slice(&self.proposer_index.to_le_bytes());
+        bytes.extend_from_slice(&(body_len as u32).to_le_bytes());
         bytes.extend_from_slice(&self.tx_count.to_le_bytes());
-        for len in &self.tx_lengths {
-            bytes.extend_from_slice(&len.to_le_bytes());
-        }
+
+        // Write TxEntries
         for tx in &self.tx_data {
+            bytes.extend_from_slice(&(tx.len() as u16).to_le_bytes());
             bytes.extend_from_slice(tx);
         }
         bytes
@@ -544,19 +578,24 @@ mod tests {
     #[test]
     fn test_mcp_payload_serialization() {
         let payload = McpPayload {
-            payload_len: 100,
+            payload_version: 1,
+            slot: 12345,
+            proposer_index: 3,
+            payload_len: 56, // 2 + (2+20) + (2+30) = 56
             tx_count: 2,
-            tx_lengths: vec![20, 30],
             tx_data: vec![vec![1u8; 20], vec![2u8; 30]],
         };
 
         let bytes = payload.to_bytes();
         let parsed = McpPayload::from_bytes(&bytes).unwrap();
 
-        assert_eq!(parsed.payload_len, 100);
+        assert_eq!(parsed.payload_version, 1);
+        assert_eq!(parsed.slot, 12345);
+        assert_eq!(parsed.proposer_index, 3);
         assert_eq!(parsed.tx_count, 2);
-        assert_eq!(parsed.tx_lengths, vec![20, 30]);
         assert_eq!(parsed.tx_data.len(), 2);
+        assert_eq!(parsed.tx_data[0].len(), 20);
+        assert_eq!(parsed.tx_data[1].len(), 30);
     }
 
     #[test]
@@ -629,9 +668,11 @@ mod tests {
         result.add_payload(
             0,
             ReconstructionResult::Success(McpPayload {
-                payload_len: 100,
+                payload_version: 1,
+                slot: 100,
+                proposer_index: 0,
+                payload_len: 106, // 2 + (2+50) + (2+50)
                 tx_count: 2,
-                tx_lengths: vec![50, 50],
                 tx_data: vec![tx1.clone(), tx2.clone()],
             }),
         );
@@ -640,9 +681,11 @@ mod tests {
         result.add_payload(
             1,
             ReconstructionResult::Success(McpPayload {
-                payload_len: 100,
+                payload_version: 1,
+                slot: 100,
+                proposer_index: 1,
+                payload_len: 106,
                 tx_count: 2,
-                tx_lengths: vec![50, 50],
                 tx_data: vec![tx2.clone(), tx3.clone()],
             }),
         );
@@ -667,7 +710,7 @@ mod tests {
 
     #[test]
     fn test_reconstruction_result_variants() {
-        let payload = McpPayload::empty();
+        let payload = McpPayload::empty(100, 0);
 
         let success = ReconstructionResult::Success(payload);
         assert!(matches!(success, ReconstructionResult::Success(_)));

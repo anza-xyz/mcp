@@ -212,61 +212,66 @@ mod tests {
 pub mod transaction {
     use super::*;
 
-    /// Bit flags for MCP transaction configuration mask.
+    /// Bit flags for MCP transaction configuration mask (u32 per spec §7.2).
     ///
     /// These flags indicate which optional fields are present in the
     /// serialized MCP transaction config.
     pub mod config_mask {
-        /// Indicates inclusion_fee field is present
-        pub const INCLUSION_FEE: u8 = 0b0000_0001;
-        /// Indicates ordering_fee field is present
-        pub const ORDERING_FEE: u8 = 0b0000_0010;
-        /// Indicates target_proposer field is present
-        pub const TARGET_PROPOSER: u8 = 0b0000_0100;
+        /// Bit 0: inclusion_fee field is present
+        pub const INCLUSION_FEE: u32 = 1 << 0;
+        /// Bit 1: ordering_fee field is present
+        pub const ORDERING_FEE: u32 = 1 << 1;
+        /// Bit 2: compute_unit_limit field is present
+        pub const COMPUTE_UNIT_LIMIT: u32 = 1 << 2;
+        /// Bit 3: accounts_data_size_limit field is present
+        pub const ACCOUNTS_DATA_SIZE_LIMIT: u32 = 1 << 3;
+        /// Bit 4: heap_size field is present
+        pub const HEAP_SIZE: u32 = 1 << 4;
+        /// Bit 5: target_proposer field is present
+        pub const TARGET_PROPOSER: u32 = 1 << 5;
     }
 
-    /// MCP-specific transaction configuration.
+    /// MCP-specific transaction configuration per spec §7.
     ///
     /// This config extends standard Solana transactions with MCP-specific
     /// fee fields and targeting options. When serialized, only non-default
-    /// fields are included, prefixed by a config mask byte.
+    /// fields are included, prefixed by a config mask.
     ///
-    /// # Serialization Format (per MCP spec §7)
+    /// # Serialization Format (per MCP spec §7.2)
     ///
     /// ```text
-    /// | config_mask (1 byte) | inclusion_fee (8 bytes, optional) |
-    /// | ordering_fee (8 bytes, optional) | target_proposer (4 bytes, optional) |
+    /// | config_mask (4 bytes) | fields in ascending bit order (4 bytes each) |
     /// ```
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
     pub struct McpTransactionConfig {
-        /// Fee paid to proposers for data availability.
-        ///
-        /// This fee is charged regardless of transaction execution outcome
-        /// and compensates proposers for including the transaction in their
-        /// batch. Paid in lamports.
-        pub inclusion_fee: u64,
+        /// Fee paid to proposers for data availability (lamports, u32).
+        pub inclusion_fee: u32,
 
-        /// Fee paid for transaction ordering priority.
-        ///
-        /// Higher ordering fees result in earlier execution within the
-        /// proposer's batch. Paid in lamports.
-        pub ordering_fee: u64,
+        /// Fee paid for transaction ordering priority (lamports, u32).
+        pub ordering_fee: u32,
 
-        /// Optional target proposer index.
-        ///
-        /// If set, the transaction should only be processed by the specified
-        /// proposer (by index in the proposer schedule, 0 to NUM_PROPOSERS-1).
-        /// This allows users to select a specific proposer for their transactions.
-        /// If `None`, any proposer may include it.
+        /// Requested compute unit limit.
+        pub compute_unit_limit: Option<u32>,
+
+        /// Requested accounts data size limit.
+        pub accounts_data_size_limit: Option<u32>,
+
+        /// Requested heap size.
+        pub heap_size: Option<u32>,
+
+        /// Optional target proposer index [0..NUM_PROPOSERS-1].
         pub target_proposer: Option<u32>,
     }
 
     impl McpTransactionConfig {
         /// Create a new MCP transaction config with the specified fees.
-        pub const fn new(inclusion_fee: u64, ordering_fee: u64) -> Self {
+        pub const fn new(inclusion_fee: u32, ordering_fee: u32) -> Self {
             Self {
                 inclusion_fee,
                 ordering_fee,
+                compute_unit_limit: None,
+                accounts_data_size_limit: None,
+                heap_size: None,
                 target_proposer: None,
             }
         }
@@ -274,25 +279,37 @@ pub mod transaction {
         /// Create a new MCP transaction config targeting a specific proposer.
         /// Per MCP spec §7, target_proposer is an index (0 to NUM_PROPOSERS-1).
         pub const fn with_target_proposer(
-            inclusion_fee: u64,
-            ordering_fee: u64,
+            inclusion_fee: u32,
+            ordering_fee: u32,
             target_proposer: u32,
         ) -> Self {
             Self {
                 inclusion_fee,
                 ordering_fee,
+                compute_unit_limit: None,
+                accounts_data_size_limit: None,
+                heap_size: None,
                 target_proposer: Some(target_proposer),
             }
         }
 
-        /// Returns the config mask byte indicating which fields are present.
-        pub fn config_mask(&self) -> u8 {
-            let mut mask = 0u8;
+        /// Returns the config mask (u32) indicating which fields are present.
+        pub fn config_mask(&self) -> u32 {
+            let mut mask = 0u32;
             if self.inclusion_fee > 0 {
                 mask |= config_mask::INCLUSION_FEE;
             }
             if self.ordering_fee > 0 {
                 mask |= config_mask::ORDERING_FEE;
+            }
+            if self.compute_unit_limit.is_some() {
+                mask |= config_mask::COMPUTE_UNIT_LIMIT;
+            }
+            if self.accounts_data_size_limit.is_some() {
+                mask |= config_mask::ACCOUNTS_DATA_SIZE_LIMIT;
+            }
+            if self.heap_size.is_some() {
+                mask |= config_mask::HEAP_SIZE;
             }
             if self.target_proposer.is_some() {
                 mask |= config_mask::TARGET_PROPOSER;
@@ -302,27 +319,45 @@ pub mod transaction {
 
         /// Returns the total MCP fees (inclusion + ordering).
         pub const fn total_mcp_fees(&self) -> u64 {
-            self.inclusion_fee.saturating_add(self.ordering_fee)
+            (self.inclusion_fee as u64).saturating_add(self.ordering_fee as u64)
         }
 
-        /// Serialize the MCP transaction config to bytes.
+        /// Serialize the MCP transaction config to bytes per spec §7.2.
         ///
-        /// Only non-default fields are serialized, prefixed by the config mask.
+        /// Fields are serialized in ascending bit index order.
         pub fn serialize<W: Write>(&self, writer: &mut W) -> io::Result<usize> {
             let mask = self.config_mask();
-            writer.write_all(&[mask])?;
-            let mut bytes_written = 1;
+            writer.write_all(&mask.to_le_bytes())?;
+            let mut bytes_written = 4;
 
             if mask & config_mask::INCLUSION_FEE != 0 {
                 writer.write_all(&self.inclusion_fee.to_le_bytes())?;
-                bytes_written += 8;
+                bytes_written += 4;
             }
             if mask & config_mask::ORDERING_FEE != 0 {
                 writer.write_all(&self.ordering_fee.to_le_bytes())?;
-                bytes_written += 8;
+                bytes_written += 4;
+            }
+            if mask & config_mask::COMPUTE_UNIT_LIMIT != 0 {
+                if let Some(limit) = self.compute_unit_limit {
+                    writer.write_all(&limit.to_le_bytes())?;
+                    bytes_written += 4;
+                }
+            }
+            if mask & config_mask::ACCOUNTS_DATA_SIZE_LIMIT != 0 {
+                if let Some(limit) = self.accounts_data_size_limit {
+                    writer.write_all(&limit.to_le_bytes())?;
+                    bytes_written += 4;
+                }
+            }
+            if mask & config_mask::HEAP_SIZE != 0 {
+                if let Some(size) = self.heap_size {
+                    writer.write_all(&size.to_le_bytes())?;
+                    bytes_written += 4;
+                }
             }
             if mask & config_mask::TARGET_PROPOSER != 0 {
-                if let Some(proposer_index) = &self.target_proposer {
+                if let Some(proposer_index) = self.target_proposer {
                     writer.write_all(&proposer_index.to_le_bytes())?;
                     bytes_written += 4;
                 }
@@ -331,32 +366,52 @@ pub mod transaction {
             Ok(bytes_written)
         }
 
-        /// Deserialize MCP transaction config from bytes.
+        /// Deserialize MCP transaction config from bytes per spec §7.2.
         pub fn deserialize<R: Read>(reader: &mut R) -> io::Result<Self> {
-            let mut mask_buf = [0u8; 1];
+            let mut mask_buf = [0u8; 4];
             reader.read_exact(&mut mask_buf)?;
-            let mask = mask_buf[0];
+            let mask = u32::from_le_bytes(mask_buf);
+
+            let mut buf4 = [0u8; 4];
 
             let inclusion_fee = if mask & config_mask::INCLUSION_FEE != 0 {
-                let mut buf = [0u8; 8];
-                reader.read_exact(&mut buf)?;
-                u64::from_le_bytes(buf)
+                reader.read_exact(&mut buf4)?;
+                u32::from_le_bytes(buf4)
             } else {
                 0
             };
 
             let ordering_fee = if mask & config_mask::ORDERING_FEE != 0 {
-                let mut buf = [0u8; 8];
-                reader.read_exact(&mut buf)?;
-                u64::from_le_bytes(buf)
+                reader.read_exact(&mut buf4)?;
+                u32::from_le_bytes(buf4)
             } else {
                 0
             };
 
+            let compute_unit_limit = if mask & config_mask::COMPUTE_UNIT_LIMIT != 0 {
+                reader.read_exact(&mut buf4)?;
+                Some(u32::from_le_bytes(buf4))
+            } else {
+                None
+            };
+
+            let accounts_data_size_limit = if mask & config_mask::ACCOUNTS_DATA_SIZE_LIMIT != 0 {
+                reader.read_exact(&mut buf4)?;
+                Some(u32::from_le_bytes(buf4))
+            } else {
+                None
+            };
+
+            let heap_size = if mask & config_mask::HEAP_SIZE != 0 {
+                reader.read_exact(&mut buf4)?;
+                Some(u32::from_le_bytes(buf4))
+            } else {
+                None
+            };
+
             let target_proposer = if mask & config_mask::TARGET_PROPOSER != 0 {
-                let mut buf = [0u8; 4];
-                reader.read_exact(&mut buf)?;
-                Some(u32::from_le_bytes(buf))
+                reader.read_exact(&mut buf4)?;
+                Some(u32::from_le_bytes(buf4))
             } else {
                 None
             };
@@ -364,6 +419,9 @@ pub mod transaction {
             Ok(Self {
                 inclusion_fee,
                 ordering_fee,
+                compute_unit_limit,
+                accounts_data_size_limit,
+                heap_size,
                 target_proposer,
             })
         }
@@ -371,15 +429,24 @@ pub mod transaction {
         /// Returns the serialized size in bytes.
         pub fn serialized_size(&self) -> usize {
             let mask = self.config_mask();
-            let mut size = 1; // config mask byte
+            let mut size = 4; // config mask (u32)
             if mask & config_mask::INCLUSION_FEE != 0 {
-                size += 8;
+                size += 4;
             }
             if mask & config_mask::ORDERING_FEE != 0 {
-                size += 8;
+                size += 4;
+            }
+            if mask & config_mask::COMPUTE_UNIT_LIMIT != 0 {
+                size += 4;
+            }
+            if mask & config_mask::ACCOUNTS_DATA_SIZE_LIMIT != 0 {
+                size += 4;
+            }
+            if mask & config_mask::HEAP_SIZE != 0 {
+                size += 4;
             }
             if mask & config_mask::TARGET_PROPOSER != 0 {
-                size += 4; // u32 proposer index per MCP spec §7
+                size += 4;
             }
             size
         }
@@ -502,7 +569,7 @@ pub mod transaction {
             let config = McpTransactionConfig::default();
             let mut buffer = Vec::new();
             let written = config.serialize(&mut buffer).unwrap();
-            assert_eq!(written, 1); // Only mask byte
+            assert_eq!(written, 4); // Only mask (u32)
 
             let mut cursor = std::io::Cursor::new(&buffer);
             let deserialized = McpTransactionConfig::deserialize(&mut cursor).unwrap();
@@ -515,11 +582,14 @@ pub mod transaction {
             let config = McpTransactionConfig {
                 inclusion_fee: 1000,
                 ordering_fee: 0,
+                compute_unit_limit: None,
+                accounts_data_size_limit: None,
+                heap_size: None,
                 target_proposer: None,
             };
             let mut buffer = Vec::new();
             config.serialize(&mut buffer).unwrap();
-            assert_eq!(buffer.len(), 9); // 1 mask + 8 inclusion_fee
+            assert_eq!(buffer.len(), 8); // 4 mask + 4 inclusion_fee
 
             let mut cursor = std::io::Cursor::new(&buffer);
             let deserialized = McpTransactionConfig::deserialize(&mut cursor).unwrap();
