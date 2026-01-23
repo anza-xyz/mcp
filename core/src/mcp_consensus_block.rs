@@ -15,8 +15,9 @@ use {
     solana_clock::Slot,
     solana_hash::Hash,
     solana_keypair::Keypair,
-    solana_ledger::mcp_attestation::{
-        AttestationEntry, RelayAttestation, ATTESTATION_ENTRY_SIZE,
+    solana_ledger::{
+        mcp::NUM_RELAYS,
+        mcp_attestation::{AttestationEntry, RelayAttestation, ATTESTATION_ENTRY_SIZE},
     },
     solana_signer::Signer,
     std::{
@@ -39,9 +40,6 @@ pub const MIN_RELAYS_IN_BLOCK: usize = 120;
 
 /// Minimum percentage of relays attesting to a proposer for inclusion
 pub const MIN_PROPOSER_ATTESTATION_PERCENTAGE: f64 = 0.40;
-
-/// Total number of relays
-pub const NUM_RELAYS: u16 = 200;
 
 /// Delay slots for bankhash
 pub const BANKHASH_DELAY_SLOTS: u64 = 4;
