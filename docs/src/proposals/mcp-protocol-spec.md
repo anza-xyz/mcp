@@ -1,3 +1,7 @@
+---
+title: MCP Protocol Specification
+---
+
 MULTIPLE CONCURRENT PROPOSERS (MCP) PROTOCOL
 Part 1 Specification
 
@@ -16,7 +20,7 @@ outputs defined here.
 
 This section states the properties MCP is designed to provide.
 
-Safety means honest validators do not diverge or rewrite history. Once a 
+Safety means honest validators do not diverge or rewrite history. Once a
 transaction appears in a slot of an honest output log, all honest validators
 eventually record the same transaction at the same slot and never replace it.
 
@@ -57,7 +61,7 @@ The reconstruct and replay phase rebuilds proposer batches from shreds,
 verifies commitments, orders batches deterministically, and executes the
 resulting transaction log for the slot.
 
-
+```text
 +-----------+    Txs    +--------+   Shreds  +-------+   Shreds   +---------------+
 | Client(s) | --------> | Leader | --------> | Relay | ---------> | Validator(s)  |<---+
 +-----------+           +--------+           +-------+            +---------------+    |
@@ -66,9 +70,11 @@ resulting transaction log for the slot.
                                                                              +---------+
                                                                                Alpenglow
                                                                                Consensus
+```
 
 
 Constellation
+```text
 +-----------+    Txs    +----------+   Shreds  +-------+   Shreds   +--------------+
 | Client(s) | --------> | Proposer | --------> | Relay | ---------> | Validator(s) |<---+
 +-----------+           +----------+           +-------+            +--------------+    |
@@ -77,6 +83,7 @@ Constellation
                                                +--------+AggregateAttestation|+---------+
                                                | Leader |--------------------+ Alpenglow
                                                +--------+                      Consensus
+```
 
 
 2. Conventions and Definitions
@@ -287,6 +294,7 @@ policy except where constrained by Section 8.
 
 
 Transaction Wire Format (variable length)
+```text
 +---------------------------+----------------------------------------+
 | Field                     | Size (bytes)                           |
 +---------------------------+----------------------------------------+
@@ -304,6 +312,7 @@ Transaction Wire Format (variable length)
 |                           | + NumInstructionDataBytes)             |
 | Signatures                | 64 * NumRequiredSignatures             |
 +---------------------------+----------------------------------------+
+```
 
 7.2. Shred
 
@@ -319,6 +328,7 @@ for shred_index under the commitment.
 
 
 Shred Wire Format (variable length)
+```text
 +-----------------+------------------------------+
 | Field           | Size (bytes)                 |
 +-----------------+------------------------------+
@@ -331,6 +341,7 @@ Shred Wire Format (variable length)
 | witness         | 32 * witness_len             |
 | proposer_sig    | 64                           |
 +-----------------+------------------------------+
+```
 
 7.3. RelayAttestation
 
@@ -343,6 +354,7 @@ version, slot, relay_index, entries_len, and entries in that order.
 
 
 RelayAttestation Wire Format (variable length)
+```text
 +-----------------+----------------------------------------+
 | Field           | Size (bytes)                           |
 +-----------------+----------------------------------------+
@@ -353,6 +365,7 @@ RelayAttestation Wire Format (variable length)
 | entries         | entries_len * (4 + 32 + 64)            |
 | relay_sig       | 64                                     |
 +-----------------+----------------------------------------+
+```
 
 7.4. AggregateAttestation
 
@@ -368,6 +381,7 @@ exact serialization defined in this section.
 
 
 AggregateAttestation Wire Format (variable length)
+```text
 +-----------------+------------------------------------------------+
 | Field           | Size (bytes)                                   |
 +-----------------+------------------------------------------------+
@@ -377,8 +391,10 @@ AggregateAttestation Wire Format (variable length)
 | relays_len      | 2                                              |
 | relay_entries   | sum of per-relay entries, see below            |
 +-----------------+------------------------------------------------+
+```
 
 Relay Entry Wire Format (variable length)
+```text
 +-----------------+----------------------------------------+
 | Field           | Size (bytes)                           |
 +-----------------+----------------------------------------+
@@ -387,6 +403,7 @@ Relay Entry Wire Format (variable length)
 | entries         | entries_len * (4 + 32 + 64)            |
 | relay_sig       | 64                                     |
 +-----------------+----------------------------------------+
+```
 
 7.5. ConsensusBlock
 
@@ -404,6 +421,7 @@ the value used in consensus votes and is not computed by hashing
 aggregate_bytes.
 
 ConsensusBlock Wire Format (variable length)
+```text
 +-------------------+------------------------------+
 | Field             | Size (bytes)                 |
 +-------------------+------------------------------+
@@ -417,6 +435,7 @@ ConsensusBlock Wire Format (variable length)
 | delayed_bankhash  | 32                           |
 | leader_sig        | 64                           |
 +-------------------+------------------------------+
+```
 
 7.6. Vote
 
@@ -428,6 +447,7 @@ changed by MCP.
 
 
 Vote Wire Format
+```text
 +-----------------+------------------------------+
 | Field           | Size (bytes)                 |
 +-----------------+------------------------------+
@@ -438,6 +458,7 @@ Vote Wire Format
 | timestamp       | 8                            |
 | signature       | 64                           |
 +-----------------+------------------------------+
+```
 
 8. Handling Fee Payer DOS
 
