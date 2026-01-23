@@ -17,7 +17,7 @@
 - **Merkle proof verification**: FIXED - Code now correctly compares full 32-byte root against commitment per spec §4.4.5 (`ledger/src/mcp_merkle.rs:97-130`).
 - **Relay attestation format**: FIXED - All modules now use `proposer_index: u32` consistently (`ledger/src/mcp_attestation.rs:50`, `ledger/src/shred/mcp_shred.rs`, `core/src/mcp_consensus_block.rs`).
 - **Consensus payload type mismatch**: spec defines `AggregateAttestationV1` and block hash rules (`mcp_spec.md:418-618`), while code defines `McpBlockV1` in a separate module and does not wire it into consensus (`core/src/mcp_consensus_block.rs:1-80`).
-- **Transaction header format missing**: spec adds `transaction_config_mask` in the header and `target_proposer: u32` (`mcp_spec.md:500-511`), but code defines a separate config blob with a 1-byte mask and `target_proposer: Pubkey` (`ledger/src/mcp.rs:216-262`) and does not wire parsing into SDK/runtime.
+- **Transaction header format**: PARTIALLY FIXED - `McpTransactionConfig` uses correct types (4-byte mask, `target_proposer: u32`) per spec §7.2 (`ledger/src/mcp.rs:219-263`). Remaining: wire parsing into SDK/runtime.
 - **McpPayloadV1 not implemented**: spec defines `McpPayloadV1` and `tx_len: u16` (`mcp_spec.md:318-333`); no serialization/parsing exists in replay or banking.
 
 ## Wiring Gaps (code exists but not integrated)
@@ -34,10 +34,10 @@
 
 ## Issue-by-Issue Missing Work (latest snapshot)
 - #21 PR Spec: spec is present but code does not implement the defined wire formats or pipeline behavior (`mcp_spec.md:361-618`).
-- #19 MCP-04 Transaction format: no SDK/runtime parsing or fee integration; mismatched config layout and `target_proposer` type (`ledger/src/mcp.rs:216-262`, `mcp_spec.md:500-511`).
+- #19 MCP-04 Transaction format: PARTIALLY FIXED - `McpTransactionConfig` has correct types (u32 mask, u32 target_proposer); remaining: SDK/runtime parsing integration.
 - #18 MCP-16 Replay reconstruct: PARTIALLY FIXED - `reconstruct_slot()` and RS decoding wired in replay_stage; remaining: full integration with bank execution.
 - #17 MCP-15 Empty slots: no replay-stage handling or execution output persistence.
-- #16 MCP-14 Voting: MCP block validation/vote logic exists but is unused; implied block computation skips proposer signature checks (`core/src/mcp_consensus_block.rs:333-368`).
+- #16 MCP-14 Voting: PARTIALLY FIXED - `compute_implied_blocks_with_verification()` exists with signature verification (line 359); remaining: wire proposer pubkeys from leader_schedule_cache in replay_stage call site.
 - #15 MCP-13 Consensus broadcast: MOSTLY FIXED - `mcp_block_sender` wired replay_stage -> retransmit_stage; remaining: actual broadcast logic in retransmit.
 - #14 MCP-12 Aggregate attestations: PARTIALLY FIXED - `AttestationAggregator` wired in replay_stage main loop; format consistency now fixed (all u32).
 - #13 MCP-11 Relay submit attestations: MOSTLY FIXED - `RelayAttestationService` creates attestations with keypair; remaining: UDP send to leader.
@@ -57,7 +57,7 @@
 ## High-Risk Bugs
 - ~~Invalid MCP shreds can be accepted because Merkle proof verification is not spec-correct~~ FIXED - Now compares full 32-byte root.
 - ~~Multiple incompatible attestation formats can cause silent consensus splits~~ FIXED - All modules now use u32 for proposer_index.
-- MCP transaction header format mismatch will break clients built to spec (`mcp_spec.md:500-511`, `ledger/src/mcp.rs:216-262`).
+- ~~MCP transaction header format mismatch will break clients built to spec~~ PARTIALLY FIXED - Types are correct; remaining: SDK/runtime parsing.
 
 ## Commands Run
 - `curl -sL "https://api.github.com/repos/anza-xyz/mcp/issues?state=open&per_page=100"`
