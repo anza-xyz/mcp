@@ -900,6 +900,7 @@ impl ReplayStage {
                     (!migration_status.is_alpenglow_enabled()).then_some(&mut tbft_structs),
                     migration_status.as_ref(),
                     &votor_event_sender,
+                    &leader_schedule_cache,
                 );
                 let did_complete_bank = !new_frozen_slots.is_empty();
                 if migration_status.is_alpenglow_enabled() {
@@ -2708,6 +2709,7 @@ impl ReplayStage {
         log_messages_bytes_limit: Option<usize>,
         prioritization_fee_cache: &PrioritizationFeeCache,
         migration_status: &MigrationStatus,
+        leader_schedule_cache: &LeaderScheduleCache,
     ) -> result::Result<usize, BlockstoreProcessorError> {
         let slot = bank.slot();
 
@@ -2727,17 +2729,29 @@ impl ReplayStage {
 
                     // Track implied proposers (proposer_id -> commitment)
                     // First, try to get implied proposers from MCP consensus block if available
+                    // Get proposer pubkeys for signature verification
+                    let proposer_pubkeys = leader_schedule_cache
+                        .get_proposers_at_slot(slot, Some(&**bank))
+                        .unwrap_or_default();
+
                     let implied_proposers: Vec<(u32, Hash)> = match blockstore.get_mcp_consensus_payload(slot, bank.parent_block_id().unwrap_or_default()) {
                         Ok(Some(block_bytes)) => {
-                            // Parse MCP block and use compute_implied_blocks()
+                            // Parse MCP block and use compute_implied_blocks_with_verification()
                             match McpBlockV1::deserialize(&mut block_bytes.as_slice()) {
                                 Ok(mcp_block) => {
                                     if mcp_block.relay_entries.len() >= MIN_RELAYS_IN_BLOCK {
-                                        // Use the block's implied proposers algorithm per spec §11.2
-                                        let implied = mcp_block.compute_implied_blocks();
+                                        // Use the block's implied proposers algorithm with signature verification
+                                        // per spec §11.2 and §5.2
+                                        let implied = if !proposer_pubkeys.is_empty() {
+                                            mcp_block.compute_implied_blocks_with_verification(&proposer_pubkeys)
+                                        } else {
+                                            // Fallback without verification if pubkeys unavailable
+                                            warn!("MCP slot {} no proposer pubkeys available, skipping signature verification", slot);
+                                            mcp_block.compute_implied_blocks()
+                                        };
                                         info!(
-                                            "MCP slot {} using consensus block with {} relays, {} implied proposers",
-                                            slot, mcp_block.relay_entries.len(), implied.len()
+                                            "MCP slot {} using consensus block with {} relays, {} implied proposers (verified={})",
+                                            slot, mcp_block.relay_entries.len(), implied.len(), !proposer_pubkeys.is_empty()
                                         );
                                         implied
                                     } else {
@@ -3595,6 +3609,7 @@ impl ReplayStage {
         active_bank_slots: &[Slot],
         prioritization_fee_cache: &PrioritizationFeeCache,
         migration_status: &MigrationStatus,
+        leader_schedule_cache: &LeaderScheduleCache,
     ) -> Vec<ReplaySlotFromBlockstore> {
         // Make mutable shared structures thread safe.
         let progress = RwLock::new(progress);
@@ -3678,6 +3693,7 @@ impl ReplayStage {
                             log_messages_bytes_limit,
                             prioritization_fee_cache,
                             migration_status,
+                            leader_schedule_cache,
                         );
                         replay_blockstore_time.stop();
                         replay_result.replay_result = Some(blockstore_result);
@@ -3712,6 +3728,7 @@ impl ReplayStage {
         bank_slot: Slot,
         prioritization_fee_cache: &PrioritizationFeeCache,
         migration_status: &MigrationStatus,
+        leader_schedule_cache: &LeaderScheduleCache,
     ) -> ReplaySlotFromBlockstore {
         let mut replay_result = ReplaySlotFromBlockstore {
             is_slot_dead: false,
@@ -3769,6 +3786,7 @@ impl ReplayStage {
                     log_messages_bytes_limit,
                     prioritization_fee_cache,
                     migration_status,
+                    leader_schedule_cache,
                 );
                 replay_blockstore_time.stop();
                 replay_result.replay_result = Some(blockstore_result);
@@ -4217,6 +4235,7 @@ impl ReplayStage {
         tbft_structs: Option<&mut TowerBFTStructures>,
         migration_status: &MigrationStatus,
         votor_event_sender: &VotorEventSender,
+        leader_schedule_cache: &LeaderScheduleCache,
     ) -> Vec<Slot> /* completed slots */ {
         let active_bank_slots = bank_forks.read().unwrap().active_bank_slots();
         let num_active_banks = active_bank_slots.len();
@@ -4245,6 +4264,7 @@ impl ReplayStage {
                     &active_bank_slots,
                     prioritization_fee_cache,
                     migration_status,
+                    leader_schedule_cache,
                 )
             }
             ForkReplayMode::Serial | ForkReplayMode::Parallel(_) => active_bank_slots
@@ -4266,6 +4286,7 @@ impl ReplayStage {
                         *bank_slot,
                         prioritization_fee_cache,
                         migration_status,
+                        leader_schedule_cache,
                     )
                 })
                 .collect(),
@@ -5959,6 +5980,7 @@ pub(crate) mod tests {
                 .thread_name(|i| format!("solReplayTest{i:02}"))
                 .build()
                 .expect("new rayon threadpool");
+            let leader_schedule_cache = LeaderScheduleCache::new_from_bank(&bank1);
             let res = ReplayStage::replay_blockstore_into_bank(
                 &bank1,
                 &blockstore,
@@ -5972,6 +5994,7 @@ pub(crate) mod tests {
                 None,
                 &PrioritizationFeeCache::new(0u64),
                 &MigrationStatus::default(),
+                &leader_schedule_cache,
             );
             let max_complete_transaction_status_slot = Arc::new(AtomicU64::default());
             let rpc_subscriptions = Arc::new(RpcSubscriptions::new_for_tests(

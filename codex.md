@@ -37,7 +37,7 @@
 - #19 MCP-04 Transaction format: PARTIALLY FIXED - `McpTransactionConfig` has correct types (u32 mask, u32 target_proposer); remaining: SDK/runtime parsing integration.
 - #18 MCP-16 Replay reconstruct: PARTIALLY FIXED - `reconstruct_slot()` and RS decoding wired in replay_stage; remaining: full integration with bank execution.
 - #17 MCP-15 Empty slots: no replay-stage handling or execution output persistence.
-- #16 MCP-14 Voting: PARTIALLY FIXED - `compute_implied_blocks_with_verification()` exists with signature verification (line 359); remaining: wire proposer pubkeys from leader_schedule_cache in replay_stage call site.
+- #16 MCP-14 Voting: FIXED - `compute_implied_blocks_with_verification()` now called with proposer pubkeys from `leader_schedule_cache.get_proposers_at_slot()` in replay_stage (`core/src/replay_stage.rs:2733-2755`).
 - #15 MCP-13 Consensus broadcast: MOSTLY FIXED - `mcp_block_sender` wired replay_stage -> retransmit_stage; remaining: actual broadcast logic in retransmit.
 - #14 MCP-12 Aggregate attestations: PARTIALLY FIXED - `AttestationAggregator` wired in replay_stage main loop; format consistency now fixed (all u32).
 - #13 MCP-11 Relay submit attestations: MOSTLY FIXED - `RelayAttestationService` creates attestations with keypair; remaining: UDP send to leader.
