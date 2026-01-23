@@ -945,20 +945,20 @@ impl ReplayStage {
                     // Drain attestations from the receiver without blocking
                     while let Ok(attestation) = attestation_rx.try_recv() {
                         let slot = attestation.slot;
-                        let relay_id = attestation.relay_id;
+                        let relay_index = attestation.relay_index;
 
                         // Persist attestation to blockstore for recovery/audit
                         let mut attestation_bytes = Vec::new();
                         if attestation.serialize(&mut attestation_bytes).is_ok() {
-                            if let Err(e) = blockstore.put_mcp_relay_attestation(slot, relay_id, &attestation_bytes) {
-                                warn!("MCP: Failed to store attestation for slot {} relay {}: {}", slot, relay_id, e);
+                            if let Err(e) = blockstore.put_mcp_relay_attestation(slot, relay_index as u16, &attestation_bytes) {
+                                warn!("MCP: Failed to store attestation for slot {} relay {}: {}", slot, relay_index, e);
                             }
                         }
 
                         if mcp_attestation_aggregator.add_attestation(attestation) {
                             trace!(
                                 "MCP: Added attestation from relay {} for slot {}",
-                                relay_id, slot
+                                relay_index, slot
                             );
                         }
 
@@ -2941,7 +2941,7 @@ impl ReplayStage {
         let relay_entries: Vec<RelayEntryV1> = all_attestations
             .iter()
             .map(|attestation| RelayEntryV1 {
-                relay_index: attestation.relay_id as u32,
+                relay_index: attestation.relay_index,
                 entries: attestation.entries.clone(),
                 relay_signature: attestation.relay_signature.as_ref().try_into().unwrap_or([0u8; 64]),
             })

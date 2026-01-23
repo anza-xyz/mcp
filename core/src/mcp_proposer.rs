@@ -17,7 +17,7 @@ use {
     solana_ledger::{
         mcp::NUM_PROPOSERS,
         mcp_merkle::{
-            McpMerkleTree, LEAF_PAYLOAD_SIZE, PROOF_ENTRIES, TRUNCATED_HASH_SIZE,
+            McpMerkleTree, LEAF_PAYLOAD_SIZE, PROOF_ENTRIES, HASH_SIZE, WitnessHash,
         },
         mcp_reed_solomon::{McpReedSolomon, McpRsError, K_DATA_SHARDS, MCP_SHARD_SIZE, N_TOTAL_SHARDS},
     },
@@ -219,17 +219,17 @@ pub struct McpShred {
     pub shred_index: u16,
     /// Merkle commitment (32 bytes)
     pub commitment: Hash,
-    /// Shred payload (952 bytes)
+    /// Shred payload (1024 bytes per spec §4)
     pub shred_data: Vec<u8>,
-    /// Merkle witness (8 × 20 bytes)
-    pub witness: [solana_ledger::mcp_merkle::TruncatedHash; PROOF_ENTRIES],
+    /// Merkle witness (8 × 32 bytes per spec §6)
+    pub witness: [WitnessHash; PROOF_ENTRIES],
     /// Proposer signature (64 bytes)
     pub proposer_signature: [u8; 64],
 }
 
 impl McpShred {
     /// Total size of a serialized MCP shred
-    pub const SIZE: usize = 8 + 4 + 4 + 32 + MCP_SHARD_SIZE + 1 + (PROOF_ENTRIES * TRUNCATED_HASH_SIZE) + 64;
+    pub const SIZE: usize = 8 + 4 + 4 + 32 + MCP_SHARD_SIZE + 1 + (PROOF_ENTRIES * HASH_SIZE) + 64;
 
     /// Serialize to bytes
     pub fn serialize<W: Write>(&self, writer: &mut W) -> io::Result<()> {
@@ -274,7 +274,7 @@ impl McpShred {
         cursor.read_exact(&mut witness_len)?;
         assert_eq!(witness_len[0] as usize, PROOF_ENTRIES);
 
-        let mut witness = [[0u8; TRUNCATED_HASH_SIZE]; PROOF_ENTRIES];
+        let mut witness = [[0u8; HASH_SIZE]; PROOF_ENTRIES];
         for entry in &mut witness {
             cursor.read_exact(entry)?;
         }

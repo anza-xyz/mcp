@@ -1,20 +1,20 @@
 //! MCP (Multiple Concurrent Proposers) Shred Wire Format
 //!
-//! This module implements the `McpShredV1` wire format as defined in the MCP specification §6.1.
-//! MCP shreds have a fixed 1225-byte format that differs from standard Solana shreds:
+//! This module implements the `McpShredV1` wire format as defined in the MCP specification §7.2.
+//! MCP shreds have a variable-length format:
 //!
-//! | Offset | Field | Type | Bytes |
-//! |---:|---|---|---:|
-//! | 0 | slot | u64 | 8 |
-//! | 8 | proposer_index | u32 | 4 |
-//! | 12 | shred_index | u32 | 4 |
-//! | 16 | commitment | [u8; 32] | 32 |
-//! | 48 | shred_data | [u8; 952] | 952 |
-//! | 1000 | witness_len | u8 | 1 |
-//! | 1001 | witness | [u8; 160] | 160 |
-//! | 1161 | proposer_signature | [u8; 64] | 64 |
+//! | Field | Type | Bytes |
+//! |---|---|---:|
+//! | slot | u64 | 8 |
+//! | proposer_index | u32 | 4 |
+//! | shred_index | u32 | 4 |
+//! | commitment | [u8; 32] | 32 |
+//! | shred_data | [u8; SHRED_DATA_BYTES] | SHRED_DATA_BYTES |
+//! | witness_len | u8 | 1 |
+//! | witness | [u8; 32 * witness_len] | 32 * witness_len |
+//! | proposer_signature | [u8; 64] | 64 |
 //!
-//! Total: 1225 bytes
+//! Per spec §7.2: witness uses full 32-byte hashes, witness_len = ceil(log2(NUM_RELAYS))
 
 use {
     crate::mcp::{NUM_PROPOSERS, NUM_RELAYS},
@@ -25,23 +25,32 @@ use {
     thiserror::Error,
 };
 
-/// Total size of an MCP shred in bytes.
-pub const MCP_SHRED_TOTAL_BYTES: usize = 1225;
-
 /// Size of the shred payload (transaction data) in bytes.
-pub const MCP_SHRED_PAYLOAD_BYTES: usize = 952;
+/// Per spec §4: SHRED_DATA_BYTES is a system parameter.
+pub const SHRED_DATA_BYTES: usize = 1024;
+
+/// Alias for backward compatibility.
+pub const MCP_SHRED_PAYLOAD_BYTES: usize = SHRED_DATA_BYTES;
 
 /// Size of the Merkle root/commitment in bytes.
 pub const MERKLE_ROOT_BYTES: usize = 32;
 
-/// Size of each truncated Merkle proof entry in bytes.
-pub const MERKLE_PROOF_ENTRY_BYTES: usize = 20;
+/// Size of each Merkle proof entry in bytes (full 32-byte hash per spec §7.2).
+pub const MERKLE_PROOF_ENTRY_BYTES: usize = 32;
 
-/// Number of Merkle proof entries (tree depth).
+/// Number of Merkle proof entries (tree depth = ceil(log2(NUM_RELAYS))).
+/// With NUM_RELAYS=200, this is ceil(log2(200)) = 8.
 pub const MERKLE_PROOF_ENTRIES: usize = 8;
 
 /// Total size of the Merkle witness in bytes.
-pub const MERKLE_PROOF_BYTES: usize = MERKLE_PROOF_ENTRY_BYTES * MERKLE_PROOF_ENTRIES; // 160
+pub const MERKLE_PROOF_BYTES: usize = MERKLE_PROOF_ENTRY_BYTES * MERKLE_PROOF_ENTRIES; // 256
+
+/// Fixed header size before shred_data: slot(8) + proposer_index(4) + shred_index(4) + commitment(32)
+const SHRED_HEADER_BYTES: usize = 8 + 4 + 4 + 32; // 48
+
+/// Total size of an MCP shred in bytes (variable, but fixed for given parameters).
+/// header(48) + shred_data(1024) + witness_len(1) + witness(256) + signature(64) = 1393
+pub const MCP_SHRED_TOTAL_BYTES: usize = SHRED_HEADER_BYTES + SHRED_DATA_BYTES + 1 + MERKLE_PROOF_BYTES + SIGNATURE_BYTES;
 
 // Offset constants for field access
 const OFFSET_SLOT: usize = 0;
@@ -49,9 +58,9 @@ const OFFSET_PROPOSER_INDEX: usize = 8;
 const OFFSET_SHRED_INDEX: usize = 12;
 const OFFSET_COMMITMENT: usize = 16;
 const OFFSET_SHRED_DATA: usize = 48;
-const OFFSET_WITNESS_LEN: usize = 1000;
-const OFFSET_WITNESS: usize = 1001;
-const OFFSET_SIGNATURE: usize = 1161;
+const OFFSET_WITNESS_LEN: usize = OFFSET_SHRED_DATA + SHRED_DATA_BYTES; // 1072
+const OFFSET_WITNESS: usize = OFFSET_WITNESS_LEN + 1; // 1073
+const OFFSET_SIGNATURE: usize = OFFSET_WITNESS + MERKLE_PROOF_BYTES; // 1329
 
 // Verify total size at compile time
 const _: () = assert!(
@@ -114,9 +123,9 @@ pub struct McpShredV1 {
     pub commitment: [u8; MERKLE_ROOT_BYTES],
 
     /// Erasure-coded payload data.
-    pub shred_data: [u8; MCP_SHRED_PAYLOAD_BYTES],
+    pub shred_data: [u8; SHRED_DATA_BYTES],
 
-    /// Merkle witness (truncated proof entries).
+    /// Merkle witness (full 32-byte hash entries per spec §7.2).
     /// Contains `MERKLE_PROOF_ENTRIES` siblings along the path from leaf to root.
     pub witness: [[u8; MERKLE_PROOF_ENTRY_BYTES]; MERKLE_PROOF_ENTRIES],
 
@@ -131,7 +140,7 @@ impl Default for McpShredV1 {
             proposer_index: 0,
             shred_index: 0,
             commitment: [0u8; MERKLE_ROOT_BYTES],
-            shred_data: [0u8; MCP_SHRED_PAYLOAD_BYTES],
+            shred_data: [0u8; SHRED_DATA_BYTES],
             witness: [[0u8; MERKLE_PROOF_ENTRY_BYTES]; MERKLE_PROOF_ENTRIES],
             proposer_signature: Signature::default(),
         }
@@ -146,7 +155,7 @@ impl McpShredV1 {
         proposer_index: u32,
         shred_index: u32,
         commitment: [u8; MERKLE_ROOT_BYTES],
-        shred_data: [u8; MCP_SHRED_PAYLOAD_BYTES],
+        shred_data: [u8; SHRED_DATA_BYTES],
         witness: [[u8; MERKLE_PROOF_ENTRY_BYTES]; MERKLE_PROOF_ENTRIES],
         proposer_signature: Signature,
     ) -> Self {
@@ -196,8 +205,8 @@ impl McpShredV1 {
             .try_into()
             .expect("slice length checked");
 
-        let shred_data: [u8; MCP_SHRED_PAYLOAD_BYTES] = data
-            [OFFSET_SHRED_DATA..OFFSET_SHRED_DATA + MCP_SHRED_PAYLOAD_BYTES]
+        let shred_data: [u8; SHRED_DATA_BYTES] = data
+            [OFFSET_SHRED_DATA..OFFSET_SHRED_DATA + SHRED_DATA_BYTES]
             .try_into()
             .expect("slice length checked");
 
@@ -251,7 +260,7 @@ impl McpShredV1 {
             .copy_from_slice(&self.shred_index.to_le_bytes());
         buf[OFFSET_COMMITMENT..OFFSET_COMMITMENT + MERKLE_ROOT_BYTES]
             .copy_from_slice(&self.commitment);
-        buf[OFFSET_SHRED_DATA..OFFSET_SHRED_DATA + MCP_SHRED_PAYLOAD_BYTES]
+        buf[OFFSET_SHRED_DATA..OFFSET_SHRED_DATA + SHRED_DATA_BYTES]
             .copy_from_slice(&self.shred_data);
         buf[OFFSET_WITNESS_LEN] = MERKLE_PROOF_ENTRIES as u8;
         for (i, entry) in self.witness.iter().enumerate() {
@@ -308,16 +317,16 @@ impl McpShredV1 {
 
     /// Verify the Merkle witness for this shred.
     ///
-    /// Per MCP spec §9.1: Verify that the Merkle witness for shred_data at
+    /// Per MCP spec §6: Verify that the Merkle witness for shred_data at
     /// index shred_index yields the commitment.
     pub fn verify_merkle_witness(&self) -> bool {
-        use crate::mcp_merkle::{MerkleProof, TRUNCATED_HASH_SIZE};
+        use crate::mcp_merkle::{MerkleProof, HASH_SIZE, PROOF_ENTRIES};
 
         // The shred_index % 256 gives the leaf index (tree has 256 leaves)
         let leaf_index = (self.shred_index % 256) as u8;
 
         // Convert the witness to the format expected by MerkleProof
-        let mut siblings = [[0u8; TRUNCATED_HASH_SIZE]; crate::mcp_merkle::PROOF_ENTRIES];
+        let mut siblings = [[0u8; HASH_SIZE]; PROOF_ENTRIES];
         for (i, entry) in self.witness.iter().enumerate() {
             siblings[i] = *entry;
         }
@@ -392,9 +401,10 @@ pub fn get_mcp_signature(data: &[u8]) -> Option<Signature> {
 
 /// Check if a packet could be an MCP shred based on size and format validation.
 ///
-/// Per MCP spec §6.1, MCP shreds have a fixed 1225-byte format.
+/// Per MCP spec §7.2, MCP shreds have a variable-length format determined by
+/// SHRED_DATA_BYTES and witness_len. For current parameters this is 1393 bytes.
 /// We validate both the size and the witness_len field to distinguish
-/// MCP shreds from legacy shreds that happen to be the same size.
+/// MCP shreds from legacy shreds.
 #[inline]
 pub fn is_mcp_shred_packet(data: &[u8]) -> bool {
     if data.len() != MCP_SHRED_TOTAL_BYTES {
@@ -408,7 +418,7 @@ pub fn is_mcp_shred_packet(data: &[u8]) -> bool {
 /// Get the shred data payload range.
 #[inline]
 pub const fn get_mcp_shred_data_range() -> std::ops::Range<usize> {
-    OFFSET_SHRED_DATA..OFFSET_SHRED_DATA + MCP_SHRED_PAYLOAD_BYTES
+    OFFSET_SHRED_DATA..OFFSET_SHRED_DATA + SHRED_DATA_BYTES
 }
 
 /// Get the witness range.
@@ -869,22 +879,23 @@ mod tests {
 
     #[test]
     fn test_shred_size_constants() {
-        // Verify the layout matches the spec
-        assert_eq!(MCP_SHRED_TOTAL_BYTES, 1225);
-        assert_eq!(MCP_SHRED_PAYLOAD_BYTES, 952);
+        // Verify the layout matches the spec §7.2
+        // With SHRED_DATA_BYTES=1024, 32-byte witness hashes, 8 entries
+        assert_eq!(MCP_SHRED_TOTAL_BYTES, 1393);
+        assert_eq!(SHRED_DATA_BYTES, 1024);
         assert_eq!(MERKLE_ROOT_BYTES, 32);
-        assert_eq!(MERKLE_PROOF_ENTRY_BYTES, 20);
+        assert_eq!(MERKLE_PROOF_ENTRY_BYTES, 32); // Full 32-byte hashes per spec
         assert_eq!(MERKLE_PROOF_ENTRIES, 8);
-        assert_eq!(MERKLE_PROOF_BYTES, 160);
+        assert_eq!(MERKLE_PROOF_BYTES, 256);
 
         // Verify layout offsets sum correctly
         let expected_size = 8  // slot
             + 4  // proposer_index
             + 4  // shred_index
             + 32 // commitment
-            + 952 // shred_data
+            + 1024 // shred_data (SHRED_DATA_BYTES)
             + 1  // witness_len
-            + 160 // witness
+            + 256 // witness (8 * 32)
             + 64; // signature
         assert_eq!(expected_size, MCP_SHRED_TOTAL_BYTES);
     }
@@ -896,7 +907,7 @@ mod tests {
             proposer_index: 5,
             shred_index: 42,
             commitment: [0xAB; MERKLE_ROOT_BYTES],
-            shred_data: [0xCD; MCP_SHRED_PAYLOAD_BYTES],
+            shred_data: [0xCD; SHRED_DATA_BYTES],
             witness: [[0xEF; MERKLE_PROOF_ENTRY_BYTES]; MERKLE_PROOF_ENTRIES],
             proposer_signature: Signature::new_unique(),
         };
@@ -967,7 +978,7 @@ mod tests {
             proposer_index: 3,
             shred_index: 100,
             commitment: [0x11; MERKLE_ROOT_BYTES],
-            shred_data: [0x22; MCP_SHRED_PAYLOAD_BYTES],
+            shred_data: [0x22; SHRED_DATA_BYTES],
             witness: [[0x33; MERKLE_PROOF_ENTRY_BYTES]; MERKLE_PROOF_ENTRIES],
             proposer_signature: Signature::new_unique(),
         };
@@ -1009,7 +1020,7 @@ mod tests {
             proposer_index: 5,
             shred_index: 42,
             commitment: [0xAB; MERKLE_ROOT_BYTES],
-            shred_data: [0xCD; MCP_SHRED_PAYLOAD_BYTES],
+            shred_data: [0xCD; SHRED_DATA_BYTES],
             witness: [[0xEF; MERKLE_PROOF_ENTRY_BYTES]; MERKLE_PROOF_ENTRIES],
             proposer_signature: Signature::default(),
         };

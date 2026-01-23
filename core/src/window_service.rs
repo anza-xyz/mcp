@@ -361,7 +361,7 @@ where
             info!(
                 "MCP: Created attestation for slot {} from relay {} with {} entries",
                 slot,
-                attestation.relay_id,
+                attestation.relay_index,
                 attestation.entries.len()
             );
             // TODO: Send attestation to leader via UDP
@@ -465,11 +465,7 @@ fn try_mcp_reconstruction(
                     index: index as u16,
                     is_data: index < MCP_DATA_SHREDS_PER_FEC_BLOCK as u64,
                     data: mcp_shred.shred_data.to_vec(),
-                    merkle_proof: mcp_shred.witness.iter().map(|w| {
-                        let mut arr = [0u8; 20];
-                        arr.copy_from_slice(w);
-                        arr
-                    }).collect(),
+                    merkle_proof: mcp_shred.witness.to_vec(),
                 });
             }
         }

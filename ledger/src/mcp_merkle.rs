@@ -1,12 +1,12 @@
 //! MCP Merkle Tree Implementation
 //!
-//! This module implements the MCP Merkle commitment scheme as defined in spec §4.3:
-//! - Fixed-depth tree with 256 leaves (depth = 8)
-//! - 20-byte truncated proof entries
+//! This module implements the MCP Merkle commitment scheme as defined in spec §6:
+//! - Fixed-depth tree with NUM_RELAYS leaves (200, padded to 256)
+//! - Full 32-byte hash entries in witness proofs
 //! - Domain-separated leaf and node hashing
 //!
-//! The commitment root is 32 bytes, while proof entries are truncated to 20 bytes
-//! to fit MCP shreds within the 1225-byte UDP packet budget.
+//! Per spec §6: "The witness is the ordered list of sibling hashes from leaf to root."
+//! Each witness entry is a full 32-byte hash.
 
 use {
     solana_hash::Hash,
@@ -32,45 +32,42 @@ pub const NUM_LEAVES: usize = 256;
 /// Tree depth (log2 of NUM_LEAVES)
 pub const TREE_DEPTH: usize = 8;
 
-/// Size of a full hash (32 bytes)
-pub const FULL_HASH_SIZE: usize = 32;
-
-/// Size of a truncated hash used in proofs (20 bytes)
-pub const TRUNCATED_HASH_SIZE: usize = 20;
+/// Size of a hash (32 bytes)
+pub const HASH_SIZE: usize = 32;
 
 /// Number of proof entries (equals tree depth)
 pub const PROOF_ENTRIES: usize = TREE_DEPTH;
 
-/// Total proof size in bytes
-pub const PROOF_SIZE: usize = PROOF_ENTRIES * TRUNCATED_HASH_SIZE;
+/// Total proof size in bytes (8 entries × 32 bytes each)
+pub const PROOF_SIZE: usize = PROOF_ENTRIES * HASH_SIZE;
 
-/// Payload size for each leaf (MCP_SHRED_PAYLOAD_BYTES)
-pub const LEAF_PAYLOAD_SIZE: usize = 952;
+/// Payload size for each leaf (SHRED_DATA_BYTES)
+pub const LEAF_PAYLOAD_SIZE: usize = 1024;
 
-/// A 20-byte truncated hash used in Merkle proofs
-pub type TruncatedHash = [u8; TRUNCATED_HASH_SIZE];
+/// A 32-byte hash used in Merkle proofs (per spec §6)
+pub type WitnessHash = [u8; HASH_SIZE];
 
 /// A Merkle proof for a single leaf
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MerkleProof {
     /// The index of the leaf in the tree (0-255)
     pub leaf_index: u8,
-    /// The sibling hashes along the path to the root (truncated to 20 bytes each)
-    pub siblings: [TruncatedHash; PROOF_ENTRIES],
+    /// The sibling hashes along the path to the root (full 32-byte hashes per spec §6)
+    pub siblings: [WitnessHash; PROOF_ENTRIES],
 }
 
 impl Default for MerkleProof {
     fn default() -> Self {
         Self {
             leaf_index: 0,
-            siblings: [[0u8; TRUNCATED_HASH_SIZE]; PROOF_ENTRIES],
+            siblings: [[0u8; HASH_SIZE]; PROOF_ENTRIES],
         }
     }
 }
 
 impl MerkleProof {
     /// Create a new proof with the given leaf index and siblings
-    pub fn new(leaf_index: u8, siblings: [TruncatedHash; PROOF_ENTRIES]) -> Self {
+    pub fn new(leaf_index: u8, siblings: [WitnessHash; PROOF_ENTRIES]) -> Self {
         Self {
             leaf_index,
             siblings,
@@ -86,8 +83,8 @@ impl MerkleProof {
     }
 
     /// Deserialize siblings from bytes
-    pub fn deserialize_siblings<R: Read>(reader: &mut R) -> io::Result<[TruncatedHash; PROOF_ENTRIES]> {
-        let mut siblings = [[0u8; TRUNCATED_HASH_SIZE]; PROOF_ENTRIES];
+    pub fn deserialize_siblings<R: Read>(reader: &mut R) -> io::Result<[WitnessHash; PROOF_ENTRIES]> {
+        let mut siblings = [[0u8; HASH_SIZE]; PROOF_ENTRIES];
         for sibling in &mut siblings {
             reader.read_exact(sibling)?;
         }
@@ -96,37 +93,29 @@ impl MerkleProof {
 
     /// Verify this proof against a commitment and leaf data
     ///
-    /// Per spec §4.4.5: At the root level, keep the full 32-byte node_hash
-    /// and compare against the full 32-byte commitment.
+    /// Per spec §6: Uses full 32-byte hashes throughout the tree.
     pub fn verify(&self, commitment: &Hash, leaf_data: &[u8]) -> bool {
-        // Compute leaf hash and truncate
+        // Compute leaf hash
         let leaf_hash = compute_leaf_hash(leaf_data);
-        let mut current_trunc = truncate_hash(&leaf_hash);
+        let mut current = hash_to_witness(&leaf_hash);
 
-        // Walk up the tree, keeping track of the full hash at the root level
+        // Walk up the tree
         let mut index = self.leaf_index as usize;
-        let mut root_hash = Hash::default();
 
-        for (level, sibling) in self.siblings.iter().enumerate() {
+        for sibling in self.siblings.iter() {
             let (left, right) = if index % 2 == 0 {
-                (&current_trunc, sibling)
+                (&current, sibling)
             } else {
-                (sibling, &current_trunc)
+                (sibling, &current)
             };
 
             let node_hash = compute_node_hash(left, right);
-
-            // At the root level (level 7), keep the full 32-byte hash
-            if level == PROOF_ENTRIES - 1 {
-                root_hash = node_hash;
-            } else {
-                current_trunc = truncate_hash(&node_hash);
-            }
+            current = hash_to_witness(&node_hash);
             index /= 2;
         }
 
-        // Compare full 32-byte root against commitment (spec §4.4.5)
-        root_hash == *commitment
+        // Compare root against commitment
+        current == commitment.as_ref()
     }
 }
 
@@ -143,8 +132,8 @@ pub fn compute_leaf_hash(leaf_data: &[u8]) -> Hash {
 
 /// Compute the node hash from two child hashes with domain separation
 ///
-/// node_hash = SHA256(NODE_PREFIX || NODE_DOMAIN || left20 || right20)
-pub fn compute_node_hash(left: &TruncatedHash, right: &TruncatedHash) -> Hash {
+/// node_hash = SHA256(NODE_PREFIX || NODE_DOMAIN || left || right)
+pub fn compute_node_hash(left: &WitnessHash, right: &WitnessHash) -> Hash {
     let mut hasher = Hasher::default();
     hasher.hash(&[NODE_PREFIX]);
     hasher.hash(NODE_DOMAIN);
@@ -153,11 +142,11 @@ pub fn compute_node_hash(left: &TruncatedHash, right: &TruncatedHash) -> Hash {
     Hash::new_from_array(hasher.result().to_bytes())
 }
 
-/// Truncate a 32-byte hash to 20 bytes
-pub fn truncate_hash(hash: &Hash) -> TruncatedHash {
-    let mut truncated = [0u8; TRUNCATED_HASH_SIZE];
-    truncated.copy_from_slice(&hash.as_ref()[..TRUNCATED_HASH_SIZE]);
-    truncated
+/// Convert a Hash to a WitnessHash (same size, just different type)
+pub fn hash_to_witness(hash: &Hash) -> WitnessHash {
+    let mut result = [0u8; HASH_SIZE];
+    result.copy_from_slice(hash.as_ref());
+    result
 }
 
 /// MCP Merkle tree builder
@@ -165,11 +154,11 @@ pub fn truncate_hash(hash: &Hash) -> TruncatedHash {
 /// Builds a fixed-depth Merkle tree from shred payloads and generates proofs.
 #[allow(dead_code)]
 pub struct McpMerkleTree {
-    /// Leaf hashes (truncated to 20 bytes)
-    leaf_hashes: Vec<TruncatedHash>,
-    /// Internal node hashes at each level (truncated to 20 bytes)
+    /// Leaf hashes (full 32-byte hashes per spec §6)
+    leaf_hashes: Vec<WitnessHash>,
+    /// Internal node hashes at each level (full 32-byte hashes)
     /// Level 0 = leaves, Level 7 = just below root
-    levels: Vec<Vec<TruncatedHash>>,
+    levels: Vec<Vec<WitnessHash>>,
     /// The commitment (full 32-byte root hash)
     commitment: Hash,
 }
@@ -187,12 +176,12 @@ impl McpMerkleTree {
         for payload in payloads {
             assert_eq!(payload.len(), LEAF_PAYLOAD_SIZE, "Invalid payload size");
             let hash = compute_leaf_hash(payload);
-            leaf_hashes.push(truncate_hash(&hash));
+            leaf_hashes.push(hash_to_witness(&hash));
         }
 
         // Pad with zero-payload leaves if needed
         let zero_payload = [0u8; LEAF_PAYLOAD_SIZE];
-        let zero_leaf_hash = truncate_hash(&compute_leaf_hash(&zero_payload));
+        let zero_leaf_hash = hash_to_witness(&compute_leaf_hash(&zero_payload));
         while leaf_hashes.len() < NUM_LEAVES {
             leaf_hashes.push(zero_leaf_hash);
         }
@@ -207,7 +196,7 @@ impl McpMerkleTree {
                 let left = &current_level[i];
                 let right = &current_level[i + 1];
                 let node_hash = compute_node_hash(left, right);
-                next_level.push(truncate_hash(&node_hash));
+                next_level.push(hash_to_witness(&node_hash));
             }
             levels.push(current_level);
             current_level = next_level;
@@ -232,16 +221,16 @@ impl McpMerkleTree {
         self.commitment
     }
 
-    /// Get the truncated commitment (first 20 bytes)
-    pub fn truncated_commitment(&self) -> TruncatedHash {
-        truncate_hash(&self.commitment)
+    /// Get the commitment as a WitnessHash
+    pub fn commitment_as_witness(&self) -> WitnessHash {
+        hash_to_witness(&self.commitment)
     }
 
     /// Generate a proof for the given leaf index
     pub fn get_proof(&self, leaf_index: u8) -> MerkleProof {
         assert!((leaf_index as usize) < NUM_LEAVES, "Invalid leaf index");
 
-        let mut siblings = [[0u8; TRUNCATED_HASH_SIZE]; PROOF_ENTRIES];
+        let mut siblings = [[0u8; HASH_SIZE]; PROOF_ENTRIES];
         let mut index = leaf_index as usize;
 
         for (depth, level) in self.levels.iter().enumerate() {
@@ -342,8 +331,8 @@ mod tests {
 
     #[test]
     fn test_node_hash_deterministic() {
-        let left = [1u8; TRUNCATED_HASH_SIZE];
-        let right = [2u8; TRUNCATED_HASH_SIZE];
+        let left = [1u8; HASH_SIZE];
+        let right = [2u8; HASH_SIZE];
         let hash1 = compute_node_hash(&left, &right);
         let hash2 = compute_node_hash(&left, &right);
         assert_eq!(hash1, hash2);
@@ -351,19 +340,19 @@ mod tests {
 
     #[test]
     fn test_node_hash_order_matters() {
-        let left = [1u8; TRUNCATED_HASH_SIZE];
-        let right = [2u8; TRUNCATED_HASH_SIZE];
+        let left = [1u8; HASH_SIZE];
+        let right = [2u8; HASH_SIZE];
         let hash_lr = compute_node_hash(&left, &right);
         let hash_rl = compute_node_hash(&right, &left);
         assert_ne!(hash_lr, hash_rl);
     }
 
     #[test]
-    fn test_truncate_hash() {
+    fn test_hash_to_witness() {
         let hash = Hash::from([42u8; 32]);
-        let truncated = truncate_hash(&hash);
-        assert_eq!(truncated.len(), TRUNCATED_HASH_SIZE);
-        assert_eq!(truncated, [42u8; TRUNCATED_HASH_SIZE]);
+        let witness = hash_to_witness(&hash);
+        assert_eq!(witness.len(), HASH_SIZE);
+        assert_eq!(witness, [42u8; HASH_SIZE]);
     }
 
     #[test]

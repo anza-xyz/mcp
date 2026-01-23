@@ -1009,7 +1009,7 @@ mod tests {
             let attestation = RelayAttestation {
                 version: 1,
                 slot: 100,
-                relay_id: i as u16,
+                relay_index: i as u32,
                 entries: vec![make_test_attestation_entry(0, 1)],
                 relay_signature: solana_signature::Signature::default(),
             };
@@ -1083,7 +1083,7 @@ mod tests {
             let attestation = RelayAttestation {
                 version: 1,
                 slot: 100,
-                relay_id: i as u16,
+                relay_index: i as u32,
                 entries: vec![make_test_attestation_entry(0, 1)],
                 relay_signature: solana_signature::Signature::default(),
             };

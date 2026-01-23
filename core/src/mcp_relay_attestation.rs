@@ -180,8 +180,8 @@ pub struct SignedAttestation {
 /// Configuration for the relay attestation service.
 #[derive(Debug, Clone)]
 pub struct RelayAttestationConfig {
-    /// This relay's ID in the schedule
-    pub relay_id: u16,
+    /// This relay's index in the schedule (u32 per spec §7.3)
+    pub relay_index: u32,
     /// Maximum slots to track
     pub max_tracked_slots: usize,
 }
@@ -189,7 +189,7 @@ pub struct RelayAttestationConfig {
 impl Default for RelayAttestationConfig {
     fn default() -> Self {
         Self {
-            relay_id: 0,
+            relay_index: 0,
             max_tracked_slots: 32,
         }
     }
@@ -273,7 +273,7 @@ impl RelayAttestationService {
         proposers: Vec<(u32, Hash, solana_signature::Signature)>,
         keypair: &Keypair,
     ) -> RelayAttestation {
-        let mut builder = RelayAttestationBuilder::new(slot, self.config.relay_id);
+        let mut builder = RelayAttestationBuilder::new(slot, self.config.relay_index);
 
         for (proposer_id, commitment, proposer_signature) in proposers {
             builder = builder.add_entry(proposer_id, commitment, proposer_signature);
@@ -287,7 +287,7 @@ impl RelayAttestationService {
 
         RelayAttestation::new_signed(
             slot,
-            self.config.relay_id,
+            self.config.relay_index,
             unsigned.entries,
             signature,
         )
@@ -301,9 +301,9 @@ impl RelayAttestationService {
         self.slot_states.retain(|&slot, _| slot >= min_slot);
     }
 
-    /// Get the current relay ID.
-    pub fn relay_id(&self) -> u16 {
-        self.config.relay_id
+    /// Get the current relay index.
+    pub fn relay_index(&self) -> u32 {
+        self.config.relay_index
     }
 
     /// Get statistics.
@@ -319,8 +319,8 @@ impl RelayAttestationService {
 /// Tracks attestations from relays for a slot.
 #[derive(Debug, Default)]
 pub struct SlotAttestations {
-    /// Attestations indexed by relay_id
-    pub attestations: HashMap<u16, RelayAttestation>,
+    /// Attestations indexed by relay_index (u32 per spec §7.3)
+    pub attestations: HashMap<u32, RelayAttestation>,
     /// Per-proposer attestation counts
     pub proposer_counts: HashMap<u32, usize>,
 }
@@ -328,10 +328,10 @@ pub struct SlotAttestations {
 impl SlotAttestations {
     /// Add an attestation from a relay.
     pub fn add_attestation(&mut self, attestation: RelayAttestation) -> bool {
-        let relay_id = attestation.relay_id;
+        let relay_index = attestation.relay_index;
 
         // Check for duplicate
-        if self.attestations.contains_key(&relay_id) {
+        if self.attestations.contains_key(&relay_index) {
             return false;
         }
 
@@ -340,7 +340,7 @@ impl SlotAttestations {
             *self.proposer_counts.entry(entry.proposer_index).or_insert(0) += 1;
         }
 
-        self.attestations.insert(relay_id, attestation);
+        self.attestations.insert(relay_index, attestation);
         true
     }
 
@@ -386,10 +386,10 @@ impl SlotAttestations {
 
     /// Get all attestations for block construction.
     ///
-    /// Returns attestations sorted by relay_id for deterministic ordering.
+    /// Returns attestations sorted by relay_index for deterministic ordering.
     pub fn get_all_attestations(&self) -> Vec<&RelayAttestation> {
         let mut attestations: Vec<_> = self.attestations.values().collect();
-        attestations.sort_by_key(|a| a.relay_id);
+        attestations.sort_by_key(|a| a.relay_index);
         attestations
     }
 }
@@ -459,7 +459,7 @@ impl AttestationAggregator {
 
     /// Get all attestations for a slot for block construction.
     ///
-    /// Returns attestations sorted by relay_id for deterministic ordering.
+    /// Returns attestations sorted by relay_index for deterministic ordering.
     pub fn get_all_attestations(&self, slot: Slot) -> Vec<&RelayAttestation> {
         self.slot_attestations
             .get(&slot)
@@ -561,7 +561,7 @@ mod tests {
     #[test]
     fn test_relay_attestation_service() {
         let config = RelayAttestationConfig {
-            relay_id: 42,
+            relay_index: 42,
             max_tracked_slots: 10,
         };
         let mut service = RelayAttestationService::new(config);
@@ -592,10 +592,10 @@ mod tests {
         let mut aggregator = AttestationAggregator::new(10);
 
         // Add attestations from multiple relays
-        for relay_id in 0..MIN_RELAYS_FOR_BLOCK as u16 {
+        for relay_index in 0..MIN_RELAYS_FOR_BLOCK as u32 {
             let attestation = RelayAttestation::new_signed(
                 100,
-                relay_id,
+                relay_index,
                 vec![
                     AttestationEntry::new(0, make_test_hash(0), make_test_sig(0)),
                     AttestationEntry::new(1, make_test_hash(1), make_test_sig(1)),
@@ -619,10 +619,10 @@ mod tests {
         let mut slot_attestations = SlotAttestations::default();
 
         // Add attestations from 80 relays, all attesting to proposer 0
-        for relay_id in 0..80u16 {
+        for relay_index in 0..80u32 {
             let attestation = RelayAttestation::new_signed(
                 100,
-                relay_id,
+                relay_index,
                 vec![AttestationEntry::new(0, make_test_hash(0), make_test_sig(0))],
                 solana_signature::Signature::default(),
             );
@@ -635,10 +635,10 @@ mod tests {
         assert_eq!(included[0].0, 0);
 
         // Add 79 more attestations for proposer 1 (not enough)
-        for relay_id in 80..159u16 {
+        for relay_index in 80..159u32 {
             let attestation = RelayAttestation::new_signed(
                 100,
-                relay_id,
+                relay_index,
                 vec![AttestationEntry::new(1, make_test_hash(1), make_test_sig(1))],
                 solana_signature::Signature::default(),
             );

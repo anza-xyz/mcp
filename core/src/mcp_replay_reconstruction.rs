@@ -166,8 +166,8 @@ pub struct ShredData {
     pub is_data: bool,
     /// The shred payload
     pub data: Vec<u8>,
-    /// Merkle proof for verification
-    pub merkle_proof: Vec<[u8; 20]>,
+    /// Merkle proof for verification (32-byte hashes per spec §6)
+    pub merkle_proof: Vec<[u8; 32]>,
 }
 
 impl ShredData {

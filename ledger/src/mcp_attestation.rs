@@ -3,11 +3,11 @@
 //! This module defines the `RelayAttestation` struct for MCP relay attestations,
 //! including deterministic encoding and signature verification.
 //!
-//! # Wire Format (v1) - Per MCP spec §6.2
+//! # Wire Format (v1) - Per MCP spec §7.3
 //!
 //! ```text
-//! | version (1 byte) | slot (8 bytes) | relay_id (2 bytes) |
-//! | num_attestations (1 byte) | entries (variable) | relay_signature (64 bytes) |
+//! | version (1 byte) | slot (8 bytes) | relay_index (4 bytes) |
+//! | entries_len (1 byte) | entries (variable) | relay_signature (64 bytes) |
 //! ```
 //!
 //! Each entry in the entries array (AttestationEntryV1):
@@ -36,8 +36,8 @@ pub const ATTESTATION_ENTRY_SIZE: usize = 4 + 32 + 64; // 100 bytes
 pub const MAX_ATTESTATION_ENTRIES: usize = 16;
 
 /// Minimum size of a serialized attestation (header + signature, no entries).
-/// version(1) + slot(8) + relay_id(2) + num_attestations(1) + relay_signature(64) = 76 bytes
-pub const MIN_ATTESTATION_SIZE: usize = 1 + 8 + 2 + 1 + 64; // 76 bytes
+/// version(1) + slot(8) + relay_index(4) + entries_len(1) + relay_signature(64) = 78 bytes
+pub const MIN_ATTESTATION_SIZE: usize = 1 + 8 + 4 + 1 + 64; // 78 bytes
 
 /// A single entry in a relay attestation (AttestationEntryV1).
 ///
@@ -130,9 +130,9 @@ pub struct RelayAttestation {
     pub version: u8,
     /// The slot this attestation is for.
     pub slot: u64,
-    /// The relay's ID within the epoch schedule.
-    pub relay_id: u16,
-    /// Attestation entries, sorted by proposer_id.
+    /// The relay's index within the epoch schedule (u32 per spec §7.3).
+    pub relay_index: u32,
+    /// Attestation entries, sorted by proposer_index.
     pub entries: Vec<AttestationEntry>,
     /// The relay's signature over the attestation data.
     pub relay_signature: Signature,
@@ -141,14 +141,14 @@ pub struct RelayAttestation {
 impl RelayAttestation {
     /// Create a new relay attestation.
     ///
-    /// Entries will be sorted by proposer_id automatically.
+    /// Entries will be sorted by proposer_index automatically.
     /// The signature should be set later after serializing the unsigned portion.
-    pub fn new(slot: u64, relay_id: u16, mut entries: Vec<AttestationEntry>) -> Self {
+    pub fn new(slot: u64, relay_index: u32, mut entries: Vec<AttestationEntry>) -> Self {
         entries.sort();
         Self {
             version: RELAY_ATTESTATION_VERSION,
             slot,
-            relay_id,
+            relay_index,
             entries,
             relay_signature: Signature::default(),
         }
@@ -156,10 +156,10 @@ impl RelayAttestation {
 
     /// Create a new relay attestation with a signature.
     ///
-    /// Entries will be sorted by proposer_id automatically.
+    /// Entries will be sorted by proposer_index automatically.
     pub fn new_signed(
         slot: u64,
-        relay_id: u16,
+        relay_index: u32,
         mut entries: Vec<AttestationEntry>,
         signature: Signature,
     ) -> Self {
@@ -167,7 +167,7 @@ impl RelayAttestation {
         Self {
             version: RELAY_ATTESTATION_VERSION,
             slot,
-            relay_id,
+            relay_index,
             entries,
             relay_signature: signature,
         }
@@ -180,10 +180,10 @@ impl RelayAttestation {
 
     /// Serialize the attestation to bytes.
     ///
-    /// Per MCP spec §6.2, the wire format is:
+    /// Per MCP spec §7.3, the wire format is:
     /// ```text
-    /// | version (1) | slot (8) | relay_id (2) | num_attestations (1) |
-    /// | entries (num_attestations * 97) | relay_signature (64) |
+    /// | version (1) | slot (8) | relay_index (4) | entries_len (1) |
+    /// | entries (entries_len * 100) | relay_signature (64) |
     /// ```
     pub fn serialize<W: Write>(&self, writer: &mut W) -> io::Result<usize> {
         let mut bytes_written = 0;
@@ -196,13 +196,13 @@ impl RelayAttestation {
         writer.write_all(&self.slot.to_le_bytes())?;
         bytes_written += 8;
 
-        // Relay ID
-        writer.write_all(&self.relay_id.to_le_bytes())?;
-        bytes_written += 2;
+        // Relay index (u32 per spec §7.3)
+        writer.write_all(&self.relay_index.to_le_bytes())?;
+        bytes_written += 4;
 
         // Number of attestation entries (u8 per spec)
-        let num_attestations = self.entries.len() as u8;
-        writer.write_all(&[num_attestations])?;
+        let entries_len = self.entries.len() as u8;
+        writer.write_all(&[entries_len])?;
         bytes_written += 1;
 
         // Entries
@@ -219,13 +219,9 @@ impl RelayAttestation {
     }
 
     /// Serialize only the portion that needs to be signed (everything except signature).
-    /// Per spec §6.2: relay_sig_msg = "mcp:relay-attestation:v1" || serialize_without_relay_signature
+    /// Per spec §7.3: relay_sig is computed over version, slot, relay_index, entries_len, entries
     pub fn serialize_for_signing<W: Write>(&self, writer: &mut W) -> io::Result<usize> {
         let mut bytes_written = 0;
-
-        // Domain prefix per spec
-        writer.write_all(b"mcp:relay-attestation:v1")?;
-        bytes_written += 24;
 
         // Version
         writer.write_all(&[self.version])?;
@@ -235,13 +231,13 @@ impl RelayAttestation {
         writer.write_all(&self.slot.to_le_bytes())?;
         bytes_written += 8;
 
-        // Relay ID
-        writer.write_all(&self.relay_id.to_le_bytes())?;
-        bytes_written += 2;
+        // Relay index (u32 per spec §7.3)
+        writer.write_all(&self.relay_index.to_le_bytes())?;
+        bytes_written += 4;
 
         // Number of attestation entries (u8 per spec)
-        let num_attestations = self.entries.len() as u8;
-        writer.write_all(&[num_attestations])?;
+        let entries_len = self.entries.len() as u8;
+        writer.write_all(&[entries_len])?;
         bytes_written += 1;
 
         // Entries
@@ -261,14 +257,14 @@ impl RelayAttestation {
         buffer
     }
 
-    /// Returns the size of the signing data (domain prefix + attestation without signature).
+    /// Returns the size of the signing data (attestation without signature).
     pub fn signing_data_size(&self) -> usize {
-        24 + 1 + 8 + 2 + 1 + (self.entries.len() * ATTESTATION_ENTRY_SIZE) // domain prefix + header + entries
+        1 + 8 + 4 + 1 + (self.entries.len() * ATTESTATION_ENTRY_SIZE) // header + entries
     }
 
-    /// Returns the size of just the wire-serialized attestation (no domain prefix, with signature).
+    /// Returns the size of just the wire-serialized attestation (with signature).
     pub fn wire_size(&self) -> usize {
-        1 + 8 + 2 + 1 + (self.entries.len() * ATTESTATION_ENTRY_SIZE) + 64 // header + entries + signature
+        1 + 8 + 4 + 1 + (self.entries.len() * ATTESTATION_ENTRY_SIZE) + 64 // header + entries + signature
     }
 
     /// Returns the total serialized size of this attestation (wire format).
@@ -298,10 +294,10 @@ impl RelayAttestation {
         reader.read_exact(&mut slot_buf)?;
         let slot = u64::from_le_bytes(slot_buf);
 
-        // Relay ID
-        let mut relay_id_buf = [0u8; 2];
-        reader.read_exact(&mut relay_id_buf)?;
-        let relay_id = u16::from_le_bytes(relay_id_buf);
+        // Relay index (u32 per spec §7.3)
+        let mut relay_index_buf = [0u8; 4];
+        reader.read_exact(&mut relay_index_buf)?;
+        let relay_index = u32::from_le_bytes(relay_index_buf);
 
         // Number of attestation entries (u8 per spec)
         let mut num_attestations_buf = [0u8; 1];
@@ -342,7 +338,7 @@ impl RelayAttestation {
         Ok(Self {
             version,
             slot,
-            relay_id,
+            relay_index,
             entries,
             relay_signature,
         })
@@ -444,23 +440,23 @@ impl std::error::Error for AttestationError {}
 #[derive(Debug, Default)]
 pub struct RelayAttestationBuilder {
     slot: u64,
-    relay_id: u16,
+    relay_index: u32,
     entries: Vec<AttestationEntry>,
 }
 
 impl RelayAttestationBuilder {
     /// Create a new attestation builder for a slot.
-    pub fn new(slot: u64, relay_id: u16) -> Self {
+    pub fn new(slot: u64, relay_index: u32) -> Self {
         Self {
             slot,
-            relay_id,
+            relay_index,
             entries: Vec::new(),
         }
     }
 
     /// Add an attestation entry for a proposer.
     ///
-    /// Per MCP spec §6.2, each entry must include the proposer's signature
+    /// Per MCP spec §7.3, each entry must include the proposer's signature
     /// over the commitment to enable verification by the consensus leader.
     pub fn add_entry(
         mut self,
@@ -475,14 +471,14 @@ impl RelayAttestationBuilder {
 
     /// Build an unsigned attestation.
     pub fn build_unsigned(self) -> RelayAttestation {
-        RelayAttestation::new(self.slot, self.relay_id, self.entries)
+        RelayAttestation::new(self.slot, self.relay_index, self.entries)
     }
 
     /// Build a signed attestation.
     ///
     /// The signature is computed over the serialized attestation data.
     pub fn build_signed(self, signature: Signature) -> RelayAttestation {
-        RelayAttestation::new_signed(self.slot, self.relay_id, self.entries, signature)
+        RelayAttestation::new_signed(self.slot, self.relay_index, self.entries, signature)
     }
 }
 
@@ -547,7 +543,7 @@ mod tests {
 
         assert_eq!(attestation.version, deserialized.version);
         assert_eq!(attestation.slot, deserialized.slot);
-        assert_eq!(attestation.relay_id, deserialized.relay_id);
+        assert_eq!(attestation.relay_index, deserialized.relay_index);
         assert_eq!(attestation.entries, deserialized.entries);
         assert_eq!(attestation.relay_signature, deserialized.relay_signature);
     }
@@ -609,7 +605,7 @@ mod tests {
             .build_unsigned();
 
         assert_eq!(attestation.slot, 100);
-        assert_eq!(attestation.relay_id, 42);
+        assert_eq!(attestation.relay_index, 42);
         assert_eq!(attestation.entries.len(), 3);
         // Should be sorted
         assert_eq!(attestation.entries[0].proposer_index, 1);
@@ -640,12 +636,12 @@ mod tests {
 
         let attestation = RelayAttestation::new(100, 1, entries);
 
-        // Signing data: 24 (domain) + 1 (version) + 8 (slot) + 2 (relay_id) + 1 (num_attestations) + 2 * 97 (entries)
-        let expected_signing = 24 + 1 + 8 + 2 + 1 + 2 * ATTESTATION_ENTRY_SIZE;
+        // Signing data per spec §7.3: 1 (version) + 8 (slot) + 4 (relay_index) + 1 (entries_len) + 2 * 100 (entries)
+        let expected_signing = 1 + 8 + 4 + 1 + 2 * ATTESTATION_ENTRY_SIZE;
         assert_eq!(attestation.signing_data_size(), expected_signing);
 
-        // Wire size: 1 (version) + 8 (slot) + 2 (relay_id) + 1 (num_attestations) + 2 * 97 (entries) + 64 (sig)
-        let expected_wire = 1 + 8 + 2 + 1 + 2 * ATTESTATION_ENTRY_SIZE + 64;
+        // Wire size: 1 (version) + 8 (slot) + 4 (relay_index) + 1 (entries_len) + 2 * 100 (entries) + 64 (sig)
+        let expected_wire = 1 + 8 + 4 + 1 + 2 * ATTESTATION_ENTRY_SIZE + 64;
         assert_eq!(attestation.serialized_size(), expected_wire);
     }
 
@@ -655,18 +651,20 @@ mod tests {
         let mut buffer = Vec::new();
         buffer.push(RELAY_ATTESTATION_VERSION); // version
         buffer.extend_from_slice(&100u64.to_le_bytes()); // slot
-        buffer.extend_from_slice(&1u16.to_le_bytes()); // relay_id
-        buffer.extend_from_slice(&2u16.to_le_bytes()); // entries_len = 2
+        buffer.extend_from_slice(&1u32.to_le_bytes()); // relay_index (u32 per spec §7.3)
+        buffer.push(2); // entries_len = 2 (u8)
 
-        // Entry 1: proposer_id = 5
-        buffer.push(5);
-        buffer.extend_from_slice(&[1u8; 32]);
+        // Entry 1: proposer_index = 5 (u32), commitment (32 bytes), proposer_sig (64 bytes)
+        buffer.extend_from_slice(&5u32.to_le_bytes());
+        buffer.extend_from_slice(&[1u8; 32]); // commitment
+        buffer.extend_from_slice(&[1u8; 64]); // proposer_sig
 
-        // Entry 2: proposer_id = 3 (out of order!)
-        buffer.push(3);
-        buffer.extend_from_slice(&[2u8; 32]);
+        // Entry 2: proposer_index = 3 (out of order!)
+        buffer.extend_from_slice(&3u32.to_le_bytes());
+        buffer.extend_from_slice(&[2u8; 32]); // commitment
+        buffer.extend_from_slice(&[2u8; 64]); // proposer_sig
 
-        // Signature
+        // Relay signature
         buffer.extend_from_slice(&[0u8; 64]);
 
         let mut cursor = std::io::Cursor::new(&buffer);
