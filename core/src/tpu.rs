@@ -30,6 +30,7 @@ use {
     solana_ledger::{
         blockstore::Blockstore, blockstore_processor::TransactionStatusSender,
         entry_notifier_service::EntryNotifierSender,
+        leader_schedule_cache::LeaderScheduleCache,
     },
     solana_perf::data_budget::DataBudget,
     solana_poh::{
@@ -159,6 +160,7 @@ impl Tpu {
         key_notifiers: Arc<RwLock<KeyUpdaters>>,
         cancel: CancellationToken,
         migration_status: Arc<MigrationStatus>,
+        leader_schedule_cache: Arc<LeaderScheduleCache>,
     ) -> Self {
         let TpuSockets {
             transactions: transactions_sockets,
@@ -377,6 +379,7 @@ impl Tpu {
             xdp_sender,
             votor_event_sender,
             migration_status,
+            leader_schedule_cache,
         );
 
         let mut key_notifiers = key_notifiers.write().unwrap();

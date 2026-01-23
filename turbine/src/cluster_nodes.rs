@@ -17,7 +17,11 @@ use {
         weighted_shuffle::WeightedShuffle,
     },
     solana_keypair::Keypair,
-    solana_ledger::shred::ShredId,
+    solana_ledger::{
+        leader_schedule_cache::LeaderScheduleCache,
+        mcp::NUM_RELAYS,
+        shred::ShredId,
+    },
     solana_native_token::LAMPORTS_PER_SOL,
     solana_pubkey::Pubkey,
     solana_runtime::bank::Bank,
@@ -720,6 +724,125 @@ pub fn check_feature_activation(feature: &Pubkey, shred_slot: Slot, root_bank: &
             feature_epoch < shred_epoch
         }
     }
+}
+
+// ============================================================================
+// MCP (Multiple Concurrent Proposers) Relay Selection
+// ============================================================================
+
+/// Compute the relay index for a given shred index.
+/// Per MCP spec §9.1: relay_id = shred_index % NUM_RELAYS
+#[inline]
+pub fn get_mcp_relay_for_shred(shred_index: u32) -> u16 {
+    (shred_index as u16) % NUM_RELAYS
+}
+
+/// Get the list of relay pubkeys for a given slot.
+/// Returns None if the MCP schedule is not available for this slot.
+pub fn get_mcp_relays_for_slot(
+    slot: Slot,
+    leader_schedule_cache: &LeaderScheduleCache,
+    bank: Option<&Bank>,
+) -> Option<Vec<Pubkey>> {
+    leader_schedule_cache.get_relays_at_slot(slot, bank)
+}
+
+/// Get the list of proposer pubkeys for a given slot.
+/// Returns None if the MCP schedule is not available for this slot.
+pub fn get_mcp_proposers_for_slot(
+    slot: Slot,
+    leader_schedule_cache: &LeaderScheduleCache,
+    bank: Option<&Bank>,
+) -> Option<Vec<Pubkey>> {
+    leader_schedule_cache.get_proposers_at_slot(slot, bank)
+}
+
+/// Check if a pubkey is an MCP relay for the given slot.
+pub fn is_mcp_relay(
+    pubkey: &Pubkey,
+    slot: Slot,
+    leader_schedule_cache: &LeaderScheduleCache,
+    bank: Option<&Bank>,
+) -> bool {
+    leader_schedule_cache.is_relay_at_slot(slot, pubkey, bank)
+}
+
+/// Check if a pubkey is an MCP proposer for the given slot.
+pub fn is_mcp_proposer(
+    pubkey: &Pubkey,
+    slot: Slot,
+    leader_schedule_cache: &LeaderScheduleCache,
+    bank: Option<&Bank>,
+) -> bool {
+    leader_schedule_cache.is_proposer_at_slot(slot, pubkey, bank)
+}
+
+/// Get the proposer ID for a pubkey at a given slot.
+/// Returns None if the pubkey is not a proposer for this slot.
+pub fn get_mcp_proposer_id(
+    pubkey: &Pubkey,
+    slot: Slot,
+    leader_schedule_cache: &LeaderScheduleCache,
+    bank: Option<&Bank>,
+) -> Option<u8> {
+    leader_schedule_cache.get_proposer_id_at_slot(slot, pubkey, bank)
+}
+
+/// Get the relay ID for a pubkey at a given slot.
+/// Returns None if the pubkey is not a relay for this slot.
+pub fn get_mcp_relay_id(
+    pubkey: &Pubkey,
+    slot: Slot,
+    leader_schedule_cache: &LeaderScheduleCache,
+    bank: Option<&Bank>,
+) -> Option<u16> {
+    leader_schedule_cache.get_relay_id_at_slot(slot, pubkey, bank)
+}
+
+/// MCP relay target with contact information.
+#[derive(Debug, Clone)]
+pub struct McpRelayTarget {
+    pub relay_id: u16,
+    pub pubkey: Pubkey,
+    pub tvu_addr: Option<SocketAddr>,
+}
+
+/// Get relay targets for MCP shred distribution.
+/// Maps relay IDs to their contact information from the cluster.
+pub fn get_mcp_relay_targets<T: 'static>(
+    slot: Slot,
+    cluster_nodes: &ClusterNodes<T>,
+    leader_schedule_cache: &LeaderScheduleCache,
+    bank: Option<&Bank>,
+    socket_addr_space: &SocketAddrSpace,
+) -> Vec<McpRelayTarget> {
+    let Some(relays) = get_mcp_relays_for_slot(slot, leader_schedule_cache, bank) else {
+        return Vec::new();
+    };
+
+    relays
+        .into_iter()
+        .enumerate()
+        .filter_map(|(relay_id, pubkey)| {
+            let node_index = cluster_nodes.index.get(&pubkey)?;
+            let node = &cluster_nodes.nodes[*node_index];
+            let contact_info = node.contact_info()?;
+            let tvu_addr = contact_info.tvu(Protocol::UDP);
+
+            // Filter by socket address space
+            if let Some(addr) = &tvu_addr {
+                if !socket_addr_space.check(addr) {
+                    return None;
+                }
+            }
+
+            Some(McpRelayTarget {
+                relay_id: relay_id as u16,
+                pubkey,
+                tvu_addr,
+            })
+        })
+        .collect()
 }
 
 #[cfg(test)]

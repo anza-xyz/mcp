@@ -4,8 +4,8 @@ use {
     crate::{
         account_loader::{
             load_transaction, update_rent_exempt_status_for_account, validate_fee_payer,
-            AccountLoader, CheckedTransactionDetails, LoadedTransaction, TransactionCheckResult,
-            TransactionLoadResult, ValidatedTransactionDetails,
+            validate_mcp_fee_payer, AccountLoader, CheckedTransactionDetails, LoadedTransaction,
+            TransactionCheckResult, TransactionLoadResult, ValidatedTransactionDetails,
         },
         account_overrides::AccountOverrides,
         message_processor::process_message,
@@ -619,14 +619,38 @@ impl<FG: ForkGraph> TransactionBatchProcessor<FG> {
         update_rent_exempt_status_for_account(rent, &mut loaded_fee_payer.account);
 
         let fee_payer_index = 0;
+        let total_fee = compute_budget_and_limits.fee_details.total_fee();
+
         validate_fee_payer(
             fee_payer_address,
             &mut loaded_fee_payer.account,
             fee_payer_index,
             error_counters,
             rent,
-            compute_budget_and_limits.fee_details.total_fee(),
+            total_fee,
         )?;
+
+        // MCP: Validate that fee payer has sufficient funds for multi-proposer scenario.
+        // In MCP, the same transaction may be included by multiple proposers, so the
+        // fee payer needs enough balance to cover fees for all proposers (NUM_PROPOSERS = 16).
+        // This check uses post-fee balance to ensure sufficient reserves.
+        let is_nonce = nonce.is_some();
+        if let Err(mcp_err) = validate_mcp_fee_payer(
+            &loaded_fee_payer.account,
+            total_fee,
+            rent,
+            is_nonce,
+        ) {
+            // Log MCP fee validation failure but don't fail the transaction yet
+            // This allows gradual rollout of MCP fee requirements
+            debug!(
+                "MCP fee payer validation warning for {}: {:?}",
+                fee_payer_address, mcp_err
+            );
+            // TODO: Once MCP is fully activated, this should return an error:
+            // error_counters.insufficient_funds += 1;
+            // return Err(TransactionError::InsufficientFundsForFee);
+        }
 
         // Capture fee-subtracted fee payer account and next nonce account state
         // to commit if transaction execution fails.

@@ -4,7 +4,10 @@ use {
     solana_entry::block_component::BlockComponent,
     solana_hash::Hash,
     solana_keypair::Keypair,
-    solana_ledger::shred::{ProcessShredsStats, ReedSolomonCache, Shredder},
+    solana_ledger::{
+        leader_schedule_cache::LeaderScheduleCache,
+        shred::{ProcessShredsStats, ReedSolomonCache, Shredder},
+    },
     solana_votor::event::VotorEventSender,
     std::{thread::sleep, time::Duration},
     tokio::sync::mpsc::Sender as AsyncSender,
@@ -28,7 +31,11 @@ pub(super) struct FailEntryVerificationBroadcastRun {
 }
 
 impl FailEntryVerificationBroadcastRun {
-    pub(super) fn new(shred_version: u16, migration_status: Arc<MigrationStatus>) -> Self {
+    pub(super) fn new(
+        shred_version: u16,
+        migration_status: Arc<MigrationStatus>,
+        _leader_schedule_cache: Arc<LeaderScheduleCache>,
+    ) -> Self {
         let cluster_nodes_cache = Arc::new(ClusterNodesCache::<BroadcastStage>::new(
             CLUSTER_NODES_CACHE_NUM_EPOCH_CAP,
             CLUSTER_NODES_CACHE_TTL,

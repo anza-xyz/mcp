@@ -209,6 +209,28 @@ fn run_shred_sigverify<const K: usize>(
         let bank_forks = bank_forks.read().unwrap();
         (bank_forks.working_bank(), bank_forks.root_bank())
     };
+
+    // Process MCP shreds before regular shred verification.
+    // MCP shreds have a different format and verification scheme.
+    let my_pubkey = keypair.pubkey();
+    let current_slot = working_bank.slot();
+    let my_relay_id = cluster_nodes::get_mcp_relay_id(
+        &my_pubkey,
+        current_slot,
+        leader_schedule_cache,
+        Some(working_bank.as_ref()),
+    );
+    let (mcp_processed, mcp_verified, mcp_failed) = process_mcp_shreds_inline(
+        thread_pool,
+        shred_buffer,
+        my_relay_id,
+        leader_schedule_cache,
+        Some(working_bank.as_ref()),
+    );
+    stats.num_mcp_shreds += mcp_processed;
+    stats.num_mcp_shreds_verified += mcp_verified;
+    stats.num_mcp_shreds_failed += mcp_failed;
+
     verify_packets(
         thread_pool,
         &keypair.pubkey(),
@@ -512,6 +534,10 @@ struct ShredSigVerifyStats {
     num_unknown_block_location: usize,
     elapsed_micros: u64,
     resign_micros: u64,
+    // MCP shred stats
+    num_mcp_shreds: usize,
+    num_mcp_shreds_verified: usize,
+    num_mcp_shreds_failed: usize,
 }
 
 impl ShredSigVerifyStats {
@@ -537,6 +563,9 @@ impl ShredSigVerifyStats {
             num_unknown_block_location: 0usize,
             elapsed_micros: 0u64,
             resign_micros: 0u64,
+            num_mcp_shreds: 0usize,
+            num_mcp_shreds_verified: 0usize,
+            num_mcp_shreds_failed: 0usize,
         }
     }
 
@@ -593,6 +622,9 @@ impl ShredSigVerifyStats {
             ),
             ("elapsed_micros", self.elapsed_micros, i64),
             ("resign_micros", self.resign_micros, i64),
+            ("num_mcp_shreds", self.num_mcp_shreds, i64),
+            ("num_mcp_shreds_verified", self.num_mcp_shreds_verified, i64),
+            ("num_mcp_shreds_failed", self.num_mcp_shreds_failed, i64),
         );
         *self = Self::new(Instant::now());
     }
@@ -856,6 +888,185 @@ impl RelayShredProcessor {
             })
             .unwrap_or_default()
     }
+}
+
+// ============================================================================
+// MCP Shred Detection and Verification Wiring
+// ============================================================================
+
+use solana_ledger::shred::mcp_shred::{is_mcp_shred_packet, McpShredV1};
+
+/// Check if a packet contains an MCP shred based on its size.
+#[inline]
+pub fn is_mcp_shred(packet: &[u8]) -> bool {
+    is_mcp_shred_packet(packet)
+}
+
+/// Try to parse an MCP shred from a packet.
+pub fn try_parse_mcp_shred(packet: &[u8]) -> Option<McpShredV1> {
+    if !is_mcp_shred(packet) {
+        return None;
+    }
+    McpShredV1::from_bytes(packet).ok()
+}
+
+/// Verify an MCP shred packet.
+/// Returns the validated shred if verification passes, None otherwise.
+///
+/// Per MCP spec §9.1:
+/// 1. Verify slot and shred_index match expected relay assignment
+/// 2. Verify proposer_index is in range [0, NUM_PROPOSERS-1]
+/// 3. Verify proposer signature over (slot, proposer_index, commitment)
+/// 4. Verify Merkle witness (TODO: implement Merkle verification)
+pub fn verify_mcp_shred(
+    packet: &[u8],
+    my_relay_id: Option<u16>,
+    leader_schedule_cache: &LeaderScheduleCache,
+    bank: Option<&Bank>,
+) -> Option<McpShredV1> {
+    let mcp_shred = try_parse_mcp_shred(packet)?;
+
+    // Verify proposer_index is in range
+    if mcp_shred.proposer_index >= NUM_PROPOSERS as u32 {
+        return None;
+    }
+
+    // If we know our relay ID, verify this shred is meant for us
+    if let Some(relay_id) = my_relay_id {
+        let expected_relay = (mcp_shred.shred_index as u16) % NUM_RELAYS;
+        if expected_relay != relay_id {
+            return None;
+        }
+    }
+
+    // Get the proposer pubkey from the schedule
+    let proposer_pubkey = leader_schedule_cache
+        .get_proposers_at_slot(mcp_shred.slot, bank)?
+        .get(mcp_shred.proposer_index as usize)?
+        .clone();
+
+    // Verify proposer signature
+    if !mcp_shred.verify_signature(&proposer_pubkey) {
+        return None;
+    }
+
+    // TODO: Verify Merkle witness
+    // Per spec §9.1: Verify Merkle witness for shred_data at index shred_index yields commitment
+
+    Some(mcp_shred)
+}
+
+/// Process MCP shreds in a packet batch.
+/// Marks packets as discard if they are MCP shreds that fail verification.
+/// Returns the number of MCP shreds processed.
+#[allow(dead_code)]
+pub fn process_mcp_shreds_in_batch(
+    packets: &mut [PacketBatch],
+    my_relay_id: Option<u16>,
+    leader_schedule_cache: &LeaderScheduleCache,
+    bank: Option<&Bank>,
+    stats: &McpShredStats,
+) -> usize {
+    let mut count = 0;
+    for batch in packets.iter_mut() {
+        for mut packet in batch.iter_mut() {
+            if packet.meta().discard() {
+                continue;
+            }
+
+            let data = packet.data(..);
+            if data.is_none() {
+                continue;
+            }
+            let data = data.unwrap();
+
+            // Check if this is an MCP shred
+            if !is_mcp_shred(data) {
+                continue;
+            }
+
+            stats.num_mcp_shreds.fetch_add(1, Ordering::Relaxed);
+            count += 1;
+
+            // Try to verify the MCP shred
+            if verify_mcp_shred(data, my_relay_id, leader_schedule_cache, bank).is_none() {
+                packet.meta_mut().set_discard(true);
+                stats.num_mcp_shreds_failed.fetch_add(1, Ordering::Relaxed);
+            } else {
+                stats.num_mcp_shreds_verified.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+    count
+}
+
+/// Statistics for MCP shred processing.
+#[derive(Default)]
+pub struct McpShredStats {
+    pub num_mcp_shreds: AtomicUsize,
+    pub num_mcp_shreds_verified: AtomicUsize,
+    pub num_mcp_shreds_failed: AtomicUsize,
+}
+
+impl McpShredStats {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn reset(&self) {
+        self.num_mcp_shreds.store(0, Ordering::Relaxed);
+        self.num_mcp_shreds_verified.store(0, Ordering::Relaxed);
+        self.num_mcp_shreds_failed.store(0, Ordering::Relaxed);
+    }
+}
+
+/// Process MCP shreds inline using the thread pool.
+/// Returns (num_processed, num_verified, num_failed).
+fn process_mcp_shreds_inline(
+    thread_pool: &ThreadPool,
+    shred_buffer: &mut [PacketBatch],
+    my_relay_id: Option<u16>,
+    leader_schedule_cache: &LeaderScheduleCache,
+    bank: Option<&Bank>,
+) -> (usize, usize, usize) {
+    let processed = AtomicUsize::new(0);
+    let verified = AtomicUsize::new(0);
+    let failed = AtomicUsize::new(0);
+
+    thread_pool.install(|| {
+        shred_buffer
+            .par_iter_mut()
+            .flatten()
+            .filter(|packet| !packet.meta().discard())
+            .for_each(|mut packet| {
+                let Some(data) = packet.data(..) else {
+                    return;
+                };
+
+                // Check if this is an MCP shred by size
+                if !is_mcp_shred(data) {
+                    return;
+                }
+
+                processed.fetch_add(1, Ordering::Relaxed);
+
+                // Try to verify the MCP shred
+                if verify_mcp_shred(data, my_relay_id, leader_schedule_cache, bank).is_some() {
+                    verified.fetch_add(1, Ordering::Relaxed);
+                    // MCP shreds that pass verification are kept for further processing
+                    // They will be stored in MCP columns in blockstore
+                } else {
+                    failed.fetch_add(1, Ordering::Relaxed);
+                    packet.meta_mut().set_discard(true);
+                }
+            });
+    });
+
+    (
+        processed.load(Ordering::Relaxed),
+        verified.load(Ordering::Relaxed),
+        failed.load(Ordering::Relaxed),
+    )
 }
 
 #[cfg(test)]

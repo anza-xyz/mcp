@@ -836,6 +836,7 @@ impl BankingSimulator {
             None,
             completed_block_sender,
             migration_status,
+            leader_schedule_cache.clone(),
         );
 
         info!("Start banking stage!...");

@@ -4,7 +4,10 @@ use {
     solana_gossip::contact_info::ContactInfo,
     solana_hash::Hash,
     solana_keypair::Keypair,
-    solana_ledger::shred::{ProcessShredsStats, ReedSolomonCache, Shredder},
+    solana_ledger::{
+        leader_schedule_cache::LeaderScheduleCache,
+        shred::{ProcessShredsStats, ReedSolomonCache, Shredder},
+    },
     solana_votor::event::VotorEventSender,
 };
 #[derive(Clone)]
@@ -26,6 +29,7 @@ impl BroadcastFakeShredsRun {
         partition: usize,
         shred_version: u16,
         migration_status: Arc<MigrationStatus>,
+        _leader_schedule_cache: Arc<LeaderScheduleCache>,
     ) -> Self {
         Self {
             last_blockhash: Hash::default(),

@@ -25,6 +25,7 @@ use {
     solana_keypair::Keypair,
     solana_ledger::{
         blockstore::Blockstore,
+        leader_schedule_cache::LeaderScheduleCache,
         mcp::NUM_RELAYS,
         shred::Shred,
     },
@@ -327,6 +328,7 @@ impl BroadcastStageType {
         xdp_sender: Option<XdpSender>,
         votor_event_sender: VotorEventSender,
         migration_status: Arc<MigrationStatus>,
+        leader_schedule_cache: Arc<LeaderScheduleCache>,
     ) -> BroadcastStage {
         match self {
             BroadcastStageType::Standard => BroadcastStage::new(
@@ -339,7 +341,7 @@ impl BroadcastStageType {
                 bank_forks,
                 quic_endpoint_sender,
                 votor_event_sender.clone(),
-                StandardBroadcastRun::new(shred_version, migration_status),
+                StandardBroadcastRun::new(shred_version, migration_status, leader_schedule_cache),
                 xdp_sender,
             ),
 
@@ -353,7 +355,7 @@ impl BroadcastStageType {
                 bank_forks,
                 quic_endpoint_sender,
                 votor_event_sender.clone(),
-                FailEntryVerificationBroadcastRun::new(shred_version, migration_status),
+                FailEntryVerificationBroadcastRun::new(shred_version, migration_status, leader_schedule_cache),
                 xdp_sender,
             ),
 
@@ -367,7 +369,7 @@ impl BroadcastStageType {
                 bank_forks,
                 quic_endpoint_sender,
                 votor_event_sender.clone(),
-                BroadcastFakeShredsRun::new(0, shred_version, migration_status),
+                BroadcastFakeShredsRun::new(0, shred_version, migration_status, leader_schedule_cache),
                 xdp_sender,
             ),
 
@@ -381,7 +383,7 @@ impl BroadcastStageType {
                 bank_forks,
                 quic_endpoint_sender,
                 votor_event_sender.clone(),
-                BroadcastDuplicatesRun::new(shred_version, config.clone(), migration_status),
+                BroadcastDuplicatesRun::new(shred_version, config.clone(), migration_status, leader_schedule_cache),
                 xdp_sender,
             ),
         }

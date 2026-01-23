@@ -19,7 +19,7 @@ use {
         blockstore::{Blockstore, BlockstoreInsertionMetrics, PossibleDuplicateShred},
         blockstore_meta::BlockLocation,
         leader_schedule_cache::LeaderScheduleCache,
-        shred::{self, ReedSolomonCache, Shred},
+        shred::{self, mcp_shred::{McpShredV1, MCP_SHRED_TOTAL_BYTES}, ReedSolomonCache, Shred},
     },
     solana_measure::measure::Measure,
     solana_metrics::inc_new_counter_error,
@@ -210,6 +210,13 @@ where
     shred_receiver_elapsed.stop();
     ws_metrics.shred_receiver_elapsed_us += shred_receiver_elapsed.as_us();
     ws_metrics.run_insert_count += 1;
+
+    // Separate MCP shreds from regular shreds
+    let (mcp_shreds, regular_shreds): (Vec<_>, Vec<_>) = shreds
+        .into_iter()
+        .partition(|(shred, _, _)| shred.len() == MCP_SHRED_TOTAL_BYTES);
+
+    // Handle regular shreds
     let handle_shred = |(shred, repair, block_location): (shred::Payload, bool, BlockLocation)| {
         if accept_repairs_only && !repair {
             return None;
@@ -222,12 +229,32 @@ where
     };
     let now = Instant::now();
     let shreds: Vec<_> = thread_pool.install(|| {
-        shreds
+        regular_shreds
             .into_par_iter()
             .with_min_len(32)
             .filter_map(handle_shred)
             .collect()
     });
+
+    // Handle MCP shreds - store them in MCP columns
+    let mcp_count = mcp_shreds.len();
+    for (shred_data, _repair, _block_location) in mcp_shreds {
+        if let Ok(mcp_shred) = McpShredV1::from_bytes(&shred_data) {
+            // Store MCP shred in MCP columns
+            if let Err(e) = blockstore.put_mcp_data_shred(
+                mcp_shred.slot,
+                mcp_shred.proposer_index as u8,
+                mcp_shred.shred_index as u64,
+                &shred_data,
+            ) {
+                debug!("Failed to store MCP shred: {}", e);
+            }
+        }
+    }
+    if mcp_count > 0 {
+        trace!("Stored {} MCP shreds", mcp_count);
+    }
+
     ws_metrics.handle_packets_elapsed_us += now.elapsed().as_micros() as u64;
     ws_metrics.num_shreds_received += shreds.len();
     let completed_data_sets = blockstore.insert_shreds_at_location_handle_duplicate(

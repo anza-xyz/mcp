@@ -4,73 +4,77 @@
 - Upstream: https://github.com/anza-xyz/mcp
 - Upstream default branch: master (via `git remote show upstream`)
 - Audit mode: assume adversarial/lazy author
-<!-- CODEX_LAST_AUDITED: c5f4a1fabc59fffab7641c96b4293e70b7ba8a6c -->
-- Last updated: 2026-01-22T19:59:12Z
+<!-- CODEX_LAST_AUDITED: d3f8032859580f9928170d422384f8013e733237 -->
+- Last updated: 2026-01-23T03:32:23Z
 
 ## Latest Summary (most recent iteration)
-- New commits audited this iteration: 1
-- Highest risk finding: `mcp_spec.md` now includes wire layout and sizing that still diverge from code (witness_len size, payload format, tx_len width), so spec-as-truth marks large parts of the implementation as incorrect.
-- Test status: `cargo fmt --check` failed due to nightly-only rustfmt options and formatting diffs; clippy/test not run.
-- Issue coverage snapshot: 19 open issues fetched (unauthenticated GitHub API, first page only; no pagination). New commit updates spec only.
+- New commits audited this iteration: 6 (no new commits since last audit)
+- Audit verdict: MCP implementation is not to spec and is not fully wired into Agave; the pipeline has types but no call sites for proposer/relay/consensus/replay paths.
+- Highest risk finding: MCP core pipeline logic (attestation aggregation, voting, replay reconstruction, consensus broadcast) is removed; remaining MCP code is largely unused scaffolding.
+- Spec/code divergence: `mcp_spec.md` defines fixed-size shreds, Merkle proof rules, and a new transaction header; none are implemented in SDK/runtime or turbine wire paths.
+- Schedule/format mismatches: MCP schedule is fixed-pool rotation without per-slot new sampling; transaction config uses `Pubkey` target and is not parsed in SDK/runtime.
+- Test status: not run (no new tests executed).
+- Issue coverage snapshot: Issue metadata carried forward from prior codex snapshot; network not used to refresh GitHub issue state.
 
 ## Issue Map (Open upstream issues)
+- Issue metadata from last cached snapshot; not refreshed in this audit.
 - #19: MCP-04 Transaction: update transaction format [Proposer] — status: OPEN — last updated: 2026-01-21T15:45:39Z
-  - Evidence of work in this repo: e08adc174b
-  - Notes: Adds config struct only; no integration with transaction/message parsing or fee calculation.
+  - Evidence of work in this repo: `ledger/src/mcp.rs`
+  - Notes: MCP config struct exists but is not wired into SDK/transaction parsing or fee calculation; `target_proposer` uses `Pubkey` while spec defines `u32` proposer_index and a new on-wire layout.
 - #18: MCP-16 Replay: reconstruct messages from shreds [Replay] — status: OPEN — last updated: 2026-01-21T15:46:33Z
-  - Evidence of work in this repo: a9f217887f
-  - Notes: Reconstruction is a skeleton; no erasure coding or commitment verification implemented.
+  - Evidence of work in this repo: none (prior `core/src/mcp_replay.rs` removed)
+  - Notes: No RS decoding or Merkle verification in replay stage; no reconstruction pipeline exists.
 - #17: MCP-15 Replay: handle empty slots [Replay] — status: OPEN — last updated: 2026-01-21T15:46:32Z
-  - Evidence of work in this repo: a9f217887f
-  - Notes: Defines types/serialization only; no replay-stage integration.
+  - Evidence of work in this repo: none
+  - Notes: No replay-stage or blockstore integration for empty slots.
 - #16: MCP-14 Voting: validate and vote on blocks [-] — status: OPEN — last updated: 2026-01-21T15:46:30Z
-  - Evidence of work in this repo: 19c13464f1, ca7621467a
-  - Notes: Voting now accepts block_id from payload, but consensus payload ingestion is still not wired into turbine/replay.
+  - Evidence of work in this repo: none (prior `core/src/mcp_voting.rs` removed)
+  - Notes: No MCP block validation hook in replay/consensus; no `McpVoteV1` production/verification.
 - #15: MCP-13 Consensus Leader: broadcast block via turbine [Consensus] — status: OPEN — last updated: 2026-01-21T15:46:28Z
-  - Evidence of work in this repo: 19c13464f1
-  - Notes: Broadcast format defined but not wired into turbine.
+  - Evidence of work in this repo: none
+  - Notes: No MCP block payload serialization or turbine broadcast integration.
 - #14: MCP-12 Consensus Leader: aggregate relay attestations [Consensus] — status: OPEN — last updated: 2026-01-21T15:46:27Z
-  - Evidence of work in this repo: a7414945f4
-  - Notes: Aggregator does not verify signatures; assumes caller does.
+  - Evidence of work in this repo: none (prior `core/src/mcp_attestation_service.rs` removed)
+  - Notes: No relay attestation aggregation or threshold checks.
 - #13: MCP-11 Relay: submit attestations to leader [Relay] — status: OPEN — last updated: 2026-01-21T15:46:26Z
-  - Evidence of work in this repo: a7414945f4
-  - Notes: Wire format duplicates ledger module, risk of drift.
+  - Evidence of work in this repo: `ledger/src/mcp_attestation.rs`
+  - Notes: Wire format exists but no relay path emits or sends attestations; signature domain strings and entry fields differ from spec.
 - #12: MCP-09 Relay: process and verify shreds [Relay] — status: OPEN — last updated: 2026-01-21T15:45:44Z
-  - Evidence of work in this repo: 49f680818b, ca7621467a
-  - Notes: Relay assignment check added, but witness length enforcement and silent-drop policy are still missing per spec.
+  - Evidence of work in this repo: `turbine/src/sigverify_shreds.rs`
+  - Notes: Relay processor types are not called by sigverify pipeline; Merkle proof verification is absent and witness length is only capped, not enforced to 8 entries.
 - #11: MCP-07 Proposer: distribute shreds to relays [Proposer] — status: OPEN — last updated: 2026-01-21T15:45:42Z
-  - Evidence of work in this repo: ac77f71f73, ca7621467a
-  - Notes: Signature now binds shred_index, but witness length and batch size constraints are not enforced.
+  - Evidence of work in this repo: `turbine/src/broadcast_stage.rs`
+  - Notes: Proposer distributor types are not used by broadcast stage; relay mapping ignores schedule; wire format uses variable-length fields inconsistent with spec.
 - #10: MCP-19 Proposer: Bankless Leader/proposer [Proposer] — status: OPEN — last updated: 2026-01-21T15:46:36Z
-  - Evidence of work in this repo: 19c13464f1, ca7621467a
-  - Notes: Bounds checks added, but constants differ from spec and ordering is still unspecified/unenforced.
+  - Evidence of work in this repo: none (prior `core/src/mcp_bankless.rs` removed)
+  - Notes: No bankless leader/proposer flow integrated into banking or replay.
 - #9: MCP-10 Relay: record attestation [Relay] — status: OPEN — last updated: 2026-01-21T15:46:14Z
-  - Evidence of work in this repo: 5c682d6104
-  - Notes: Storage format exists but not wired to blockstore columns.
+  - Evidence of work in this repo: `ledger/src/blockstore/column.rs`, `ledger/src/blockstore_db.rs`
+  - Notes: MCP columns exist but are not wired into blockstore read/write paths or window_service ingestion.
 - #8: MCP-17 Replay: do an initial pass to deduct fees before applying state transitions [Replay] — status: OPEN — last updated: 2026-01-21T15:46:34Z
-  - Evidence of work in this repo: 7b74e1891d
-  - Notes: Fee phase implemented in isolation; not integrated with execution pipeline.
+  - Evidence of work in this repo: `svm/src/account_loader.rs`
+  - Notes: Fee phase structs exist but are not invoked by transaction processor or replay stage.
 - #7: MCP-05 Proposer: add proposerID to the shred format [Proposer] — status: OPEN — last updated: 2026-01-21T15:45:40Z
-  - Evidence of work in this repo: 3b37551c44
-  - Notes: Critical offset mismatches in parsing; legacy shreds likely broken.
+  - Evidence of work in this repo: `ledger/src/shred.rs`, `ledger/src/shred/wire.rs`
+  - Notes: MCP spec now defines a separate `McpShredV1` wire format that is not implemented; legacy shreds are not reconciled with MCP shreds.
 - #6: MCP-08 Proposer: update fee payer check to Address/test DA fee payer attacks [Proposer] — status: OPEN — last updated: 2026-01-21T15:45:43Z
-  - Evidence of work in this repo: c081d11574, ca7621467a
-  - Notes: Comments mention NUM_PROPOSERS, but enforcement remains spendable-balance only; still not integrated.
+  - Evidence of work in this repo: `svm/src/account_loader.rs`
+  - Notes: Fee payer tracker/validation helpers are unused in processing.
 - #5: MCP-02 Setup: Proposer, Relay and Leader schedule [Setup] — status: OPEN — last updated: 2026-01-21T15:45:36Z
-  - Evidence of work in this repo: bdcf8c135d, ca7621467a
-  - Notes: Modular indexing removes duplicates, but pool size uses full validator set instead of role count per spec.
+  - Evidence of work in this repo: `ledger/src/leader_schedule.rs`, `ledger/src/leader_schedule_cache.rs`, `ledger/src/leader_schedule_utils.rs`
+  - Notes: Schedule uses a fixed pool rotated per slot (no per-slot new validator sampling as spec mandates); schedule is not used by turbine/window_service.
 - #4: MCP-01 Setup: protocol constants [Setup] — status: OPEN — last updated: 2026-01-21T15:45:35Z
-  - Evidence of work in this repo: 938bdaa693
-  - Notes: Constants not wired into other modules; many duplicates in other crates.
+  - Evidence of work in this repo: `ledger/src/mcp.rs`, `ledger/src/shred.rs`, `svm/src/account_loader.rs`
+  - Notes: Constants are duplicated across crates and not consumed by runtime logic.
 - #3: MCP-06 Proposer: encode and commit [Proposer] — status: OPEN — last updated: 2026-01-21T15:45:41Z
-  - Evidence of work in this repo: af5949c9e4
-  - Notes: Constants only; shredder/merkle logic not updated to use MCP FEC.
+  - Evidence of work in this repo: `ledger/src/mcp.rs`, `ledger/src/shred.rs`
+  - Notes: FEC constants exist but no Reed–Solomon encoding or Merkle commitment generation is implemented.
 - #2: MCP-03 Setup: Adjust blockstore to handle multiple proposers and execution consensus seperation. [Setup,Replay] — status: OPEN — last updated: 2026-01-21T15:45:38Z
-  - Evidence of work in this repo: 39005c6fe5
-  - Notes: CFs added but blockstore read/write paths not updated.
+  - Evidence of work in this repo: `ledger/src/blockstore/column.rs`, `ledger/src/blockstore_db.rs`
+  - Notes: Blockstore schema changes are unused and diverge from spec’s suggested columns.
 - #1: MCP-18 Replay: output ordered transactions [Replay] — status: OPEN — last updated: 2026-01-21T15:46:35Z
-  - Evidence of work in this repo: a9f217887f
-  - Notes: Ordering logic exists but not wired into replay stage.
+  - Evidence of work in this repo: none
+  - Notes: No ordering/dedup integration in replay stage.
 
 ## Commit-by-commit audit (chronological)
 ### 938bdaa693 — MCP-01: Add McpConfig with protocol constants
@@ -328,28 +332,107 @@
 - Verdict (Risk/Confidence/Status): HIGH / HIGH / Suspicious
 - Recommended follow-ups: Pick a single wire layout (witness_len size, tx_len width, packet budget) and update code + tests to match; explicitly define MTU/overhead assumptions in spec.
 
+### fbe9f1e5b4 — Fix MCP implementation issues from codex.md audit
+- Claimed intent: Align implementation with spec findings from codex.md.
+- Suspected upstream issue(s): #5, #7, #8, #11, #12, #13, #14
+- Files changed: `core/src/mcp_attestation_service.rs`, `core/src/mcp_bankless.rs`, `ledger/src/mcp_schedule.rs`, `ledger/src/shred.rs`, `ledger/src/shred/merkle.rs`, `ledger/src/shred/wire.rs`, `svm/src/mcp_fee_payer.rs`, `turbine/src/mcp_relay.rs`, `codex.md`
+- What actually changed (brief, concrete): Added witness size enforcement, batch limits, ordering by ordering_fee+hash, fee payer scaling, relay signature verification, and shred header offset fixes in standalone MCP modules.
+- Red flags / potential defects:
+  - Fixes landed in standalone MCP modules that are later removed (see `efe05fc3cc`), so the corrected behaviors are not present in the current integrated code.
+  - No integration into the Agave pipeline; logic remained isolated even after fixes.
+- Security considerations: Improvements exist only in removed modules; current runtime paths remain unprotected.
+- Test impact: Unit tests only.
+- Verdict (Risk/Confidence/Status): MED / MED / Obsoleted
+- Recommended follow-ups: Re-apply the functional fixes in the integrated Agave paths (`broadcast_stage`, `sigverify_shreds`, `account_loader`, `replay_stage`).
+
+### 062618c036 — Update codex.md to reflect fixed audit issues
+- Claimed intent: Mark prior audit items as fixed.
+- Suspected upstream issue(s): References MCP-01..MCP-19 items implicitly.
+- Files changed: `codex.md`
+- What actually changed (brief, concrete): Documentation-only update.
+- Red flags / potential defects:
+  - Marked issues as fixed that were later removed by subsequent refactors.
+- Security considerations: None (doc-only).
+- Test impact: None.
+- Verdict (Risk/Confidence/Status): LOW / HIGH / Doc-only
+- Recommended follow-ups: Update audit status to reflect current integrated code paths.
+
+### addb78f334 — Remove standalone MCP modules - integrate into existing Agave
+- Claimed intent: Delete standalone MCP scaffolding.
+- Suspected upstream issue(s): References MCP-01..MCP-19 items implicitly.
+- Files changed: multiple MCP-specific modules removed.
+- What actually changed (brief, concrete): Removed MCP modules and MCP blockstore columns entirely.
+- Red flags / potential defects:
+  - This commit was immediately reverted, so its behavior did not persist.
+- Security considerations: None (reverted).
+- Test impact: None.
+- Verdict (Risk/Confidence/Status): LOW / HIGH / Reverted
+- Recommended follow-ups: None; see `efe05fc3cc` for the final integration approach.
+
+### 19d3a4ab6c — Revert "Remove standalone MCP modules - integrate into existing Agave"
+- Claimed intent: Restore removed MCP modules.
+- Suspected upstream issue(s): References MCP-01..MCP-19 items implicitly.
+- Files changed: MCP modules restored.
+- What actually changed (brief, concrete): Reintroduced prior MCP code; no functional changes beyond the revert.
+- Red flags / potential defects: None (revert).
+- Security considerations: None.
+- Test impact: None.
+- Verdict (Risk/Confidence/Status): LOW / HIGH / Revert
+- Recommended follow-ups: None; superseded by `efe05fc3cc`.
+
+### efe05fc3cc — Integrate MCP functionality into existing Agave modules
+- Claimed intent: Move MCP logic into Agave’s core modules and delete standalone MCP files.
+- Suspected upstream issue(s): #5, #6, #11, #12, #8
+- Files changed: `ledger/src/leader_schedule.rs`, `ledger/src/leader_schedule_cache.rs`, `ledger/src/leader_schedule_utils.rs`, `svm/src/account_loader.rs`, `turbine/src/broadcast_stage.rs`, `turbine/src/sigverify_shreds.rs`, plus removal of `core/src/mcp_*` and `turbine/src/mcp_*` modules
+- What actually changed (brief, concrete):
+  - Added MCP schedule types to leader schedule utilities.
+  - Added MCP fee payer and fee-phase types to account loader.
+  - Added proposer distribution and relay shred processor types to turbine modules.
+  - Removed all MCP consensus, replay, voting, and attestation service modules from `core/`.
+- Red flags / potential defects:
+  - New MCP types are not referenced by existing pipeline code; no call sites in broadcast/sigverify/replay/banking.
+  - Removing `core/src/mcp_*` eliminated the only implementation of MCP voting, replay reconstruction, and consensus payload handling.
+  - MCP attestation wire format remains in `ledger/src/mcp_attestation.rs` but no producer/consumer exists.
+- Security considerations: MCP is effectively disabled/incomplete; spec compliance cannot be tested or enforced.
+- Test impact: No integration tests; new types are unused.
+- Verdict (Risk/Confidence/Status): HIGH / HIGH / Incomplete
+- Recommended follow-ups: Wire MCP logic into `broadcast_stage`, `sigverify_shreds`, `window_service`, `replay_stage`, and `banking_stage` so these types are exercised.
+
+### d3f8032859 — Replace mcp_spec.md with improved spec (no-encryption version)
+- Claimed intent: Define a complete, stable MCP spec without encryption.
+- Suspected upstream issue(s): References MCP-01..MCP-19 items implicitly.
+- Files changed: `mcp_spec.md`
+- What actually changed (brief, concrete): New spec with fixed wire layouts, deterministic ordering, and explicit block/vote formats.
+- Red flags / potential defects:
+  - Spec defines a new transaction layout with `transaction_config_mask` in the header, but no SDK/runtime integration exists; compatibility with legacy and v0 transactions is unspecified.
+  - `McpShredV1` wire layout (1225 bytes, witness_len u8=8) does not match current turbine relay/proposer messages (variable-length, witness_len u16).
+  - Relay attestations in spec include proposer signatures per entry; code’s `RelayAttestation` only includes proposer_id + merkle_root.
+  - Spec mandates per-slot committee rotation with new validator sampling; leader schedule code uses a fixed pool rotated per slot.
+- Security considerations: Spec/code divergence risks incompatible third-party implementations and consensus splits if treated as authoritative.
+- Test impact: Documentation-only change; no tests updated.
+- Verdict (Risk/Confidence/Status): HIGH / HIGH / Suspicious
+- Recommended follow-ups: Define an explicit upgrade/compatibility path for transaction format and shred wire layouts; align schedule and attestation rules with implementation.
+
 ## Cross-cutting concerns (delta vs upstream)
 - Behavioral changes that span commits:
-  - Widespread constant duplication (NUM_PROPOSERS/RELAYS, CONSENSUS_PAYLOAD_PROPOSER_ID) across crates; risks drift and inconsistent behavior.
-  - Many commits define types/serialization without integrating into actual pipeline (blockstore, turbine, replay, fee processing).
-  - `mcp_spec.md` is now labeled draft but still contains rules that conflict with code (schedules, voting block_id), so external implementations remain at risk.
+  - MCP consensus/replay/voting modules were removed; only isolated type definitions remain in ledger/svm/turbine without integration.
+  - MCP types were moved into existing files but lack call sites, so the pipeline ignores MCP paths.
+  - Constants remain duplicated across crates (`ledger/src/mcp.rs`, `ledger/src/shred.rs`, `svm/src/account_loader.rs`), risking drift.
+  - The new spec is detailed but still mismatches wire formats and runtime behavior.
 - Agave integration gaps (where implementation should actually live):
-  - Shred format and header offsets must be enforced in the canonical shred parser/serializer (`ledger/src/shred.rs`, `ledger/src/shred/wire.rs`, `ledger/src/shred/merkle.rs`), not only in MCP-specific helpers.
-  - Shred ingest and dedup should be in the existing TVU pipeline (`core/src/window_service.rs`, `turbine/src/sigverify_shreds.rs`, `turbine/src/retransmit_stage.rs`), otherwise MCP shreds never enter blockstore or replay.
-  - Blockstore schema changes must be wired into primary read/write paths (`ledger/src/blockstore.rs`, `ledger/src/blockstore/column.rs`, `ledger/src/blockstore_db.rs`) and window_service insertion.
-  - Consensus payload broadcast and verification should integrate with turbine broadcast (`turbine/src/broadcast_stage/standard_broadcast_run.rs`) and validator vote flow (`core/src/replay_stage.rs`, `core/src/consensus.rs`, `core/src/cluster_slots_service.rs`).
-  - Transaction config parsing and fee calculation should be in the SDK/runtime path (`sdk/src/transaction.rs`, `sdk/src/message/*`, `fee/src/*`, `runtime/src/bank.rs`), not isolated in `ledger/src/mcp.rs`.
-  - Two-phase fee charging and ordered replay must be driven from the actual replay/execution pipeline (`core/src/replay_stage.rs`, `runtime/src/bank.rs`) rather than standalone helpers.
-- MCP-specific files created by Claude: integration plan
-  - `ledger/src/mcp.rs`: should not define parallel transaction config in ledger; move/duplicate into SDK/runtime parsing (`sdk/src/transaction.rs`, `sdk/src/message/*`, `runtime/src/bank.rs`) and hook into fee calculation (`fee/src/*`).
-  - `ledger/src/mcp_schedule.rs`, `ledger/src/mcp_schedule_cache.rs`: these should integrate with existing leader schedule utilities and caches (`ledger/src/leader_schedule_utils.rs`, `ledger/src/leader_schedule_cache.rs`) rather than introducing a parallel schedule system; consumers should be in window_service and turbine cluster_nodes.
-  - `ledger/src/mcp_attestation.rs` vs `core/src/mcp_attestation_service.rs`: wire formats must be unified; the attestation encoding should live in ledger or sdk and be consumed by core/turbine, not duplicated.
-  - `turbine/src/mcp_proposer.rs` and `turbine/src/mcp_relay.rs`: should be plugged into existing turbine broadcast and sigverify shreds pipeline; proposer/relay logic belongs in broadcast_stage and sigverify_shreds, not standalone modules.
-  - `core/src/mcp_consensus_broadcast.rs`: should be integrated into `turbine/src/broadcast_stage/standard_broadcast_run.rs` and `core/src/tpu.rs` rather than a separate payload broadcaster.
-  - `core/src/mcp_voting.rs`: must hook into actual vote generation and tower checks (`core/src/replay_stage.rs`, `core/src/consensus.rs`); otherwise it is dead logic.
-  - `core/src/mcp_replay.rs`: should become part of `core/src/replay_stage.rs` and `ledger/src/blockstore_processor.rs` to produce real execution output, not a parallel replay path.
-  - `core/src/mcp_bankless.rs`: should integrate with transaction ingestion and bankless leader paths in the existing banking pipeline (`core/src/banking_stage.rs`, `runtime/src/bank.rs`) or be removed; a detached recorder is unused.
-  - `svm/src/mcp_fee_payer.rs` and `svm/src/mcp_fee_replay.rs`: must be wired into SVM transaction processing (`svm/src/transaction_processor.rs`, `runtime/src/bank.rs`) or are effectively no-ops.
+  - MCP schedules in `ledger/src/leader_schedule.rs` are not used by `turbine/src/cluster_nodes.rs` or `core/src/window_service.rs`.
+  - Proposer distribution types in `turbine/src/broadcast_stage.rs` are not invoked by `broadcast_stage/standard_broadcast_run.rs`.
+  - Relay validation types in `turbine/src/sigverify_shreds.rs` are not invoked by the sigverify pipeline or window_service; Merkle proofs are never checked.
+  - Fee payer validation and fee-only phase in `svm/src/account_loader.rs` are not called by `svm/src/transaction_processor.rs` or `runtime/src/bank.rs`.
+  - Consensus block construction, attestation aggregation, voting, and replay reconstruction have no integration points in `core/src/replay_stage.rs` or `core/src/consensus.rs`.
+  - Blockstore MCP columns are not read/written in `ledger/src/blockstore.rs`.
+- Current integration status (post-efe05fc3cc):
+  - `ledger/src/leader_schedule.rs` contains MCP schedule types but no consumers.
+  - `turbine/src/broadcast_stage.rs` defines MCP proposer distribution types but no broadcaster uses them.
+  - `turbine/src/sigverify_shreds.rs` defines MCP relay validation types but no packet path calls them.
+  - `svm/src/account_loader.rs` defines MCP fee payer and fee-phase types but they are unused.
+  - `ledger/src/mcp_attestation.rs` defines wire format without any producer/consumer.
+  - `core/src/mcp_*` modules removed; consensus, replay, and voting logic is absent.
 ## Issue-by-issue integration map (where changes should actually live)
 - #1 MCP-18 Replay: output ordered transactions
   - Integrate into `core/src/replay_stage.rs`, `ledger/src/blockstore_processor.rs`, and execution ordering in `runtime/src/bank.rs`.
@@ -380,7 +463,7 @@
 - #14 MCP-12 Consensus leader aggregate relay attestations
   - Integrate into `core/src/consensus.rs` or leader block construction in `core/src/replay_stage.rs`.
 - #15 MCP-13 Consensus leader broadcast block via turbine
-  - Implement in `turbine/src/broadcast_stage/standard_broadcast_run.rs` with payload serialization in `core/src/mcp_consensus_broadcast.rs`.
+  - Implement in `turbine/src/broadcast_stage/standard_broadcast_run.rs` with payload serialization in `core/src/replay_stage.rs` or `core/src/consensus.rs`.
 - #16 MCP-14 Voting validate/vote on blocks
   - Integrate into `core/src/replay_stage.rs` and `core/src/consensus.rs` vote flow.
 - #17 MCP-15 Replay handle empty slots
@@ -390,105 +473,89 @@
 - #19 MCP-04 Transaction format update
   - Implement in `sdk/src/message/*`, `sdk/src/transaction.rs`, `fee/src/*`, and `runtime/src/bank.rs` fee calculation.
 - Spec divergence risk:
-  - `mcp_spec_next.md` declares itself the “source-of-truth” with stable wire formats, but its wire layout and constants conflict with `mcp_spec.md` and current code (e.g., 4-byte proposer_index and 1-byte witness_len vs 1-byte proposer_id and 2-byte witness_len). Until reconciled, `mcp_spec_next.md` should not be treated as “better” or authoritative (`mcp_spec_next.md:1`, `mcp_spec_next.md:106`, `mcp_spec_next.md:365`).
-  - MTU constraint is not consistently specified: `mcp_spec_next.md` hardcodes 1225-byte shreds but does not state the assumed MTU or overhead model, while `mcp_spec.md` uses `MAX_SHRED_DATA_SIZE` 1,228 without packet sizing context. The source-of-truth spec must define the exact MTU budget and overhead (IP/UDP/QUIC, signatures, proof sizes) or the wire format cannot be validated (`mcp_spec.md:92`, `mcp_spec_next.md:91`).
-- Spec-as-source-of-truth deviations (code is buggy where it diverges):
-  - [FIXED] Schedule pool size now equals role count (16/200) in `ledger/src/mcp_schedule.rs`.
-  - [FIXED] Shred common header offsets now correctly read `fec_set_index` at bytes 80-83 in `ledger/src/shred/merkle.rs`.
-  - [FIXED] Proposer ordering now sorts by ordering_fee DESC then tx hash ASC via `sort_for_serialization()` in `core/src/mcp_bankless.rs`.
-  - [FIXED] Witness length capped at 8 entries (160 bytes) with `MAX_WITNESS_BYTES` check in `turbine/src/mcp_relay.rs`.
-  - [FIXED] Batch limits aligned with spec (65,536 tx, 38,080 bytes, 4,096 max tx size) in `core/src/mcp_bankless.rs`.
-  - [FIXED] Verification failures silently dropped via `Option<ValidatedShred>` return type in `turbine/src/mcp_relay.rs`.
-  - [FIXED] Fee payer balance check now covers `NUM_PROPOSERS * total_fee` in `svm/src/mcp_fee_payer.rs:can_commit()`.
-  - [OPEN] Replay reconstruction must use Reed-Solomon and verify commitments; `core/src/mcp_replay.rs` uses threshold logic without erasure recovery or merkle verification (`mcp_spec.md:437`, `core/src/mcp_replay.rs:88`).
-  - [FIXED] Relay attestation aggregation now verifies relay signatures in `core/src/mcp_attestation_service.rs:add_attestation()`.
+  - `mcp_spec.md` defines new wire formats and transaction layout that are not implemented in Agave; treat the spec as aspirational until the pipeline is wired.
+  - Packet sizing and MTU assumptions are still implicit for integration with existing shred/turbine paths.
+- Spec-as-source-of-truth deviations (current):
+  - [OPEN] Committee selection: spec requires per-slot rotation with sampling a new validator; `ledger/src/leader_schedule.rs` only rotates a fixed pool.
+  - [OPEN] MCP shred wire format: spec defines fixed 1225-byte `McpShredV1` with `witness_len` u8=8; code uses variable-length relay/proposer messages and legacy `Shred` layout.
+  - [OPEN] Merkle commitments and RS encoding/decoding are not implemented; no proof verification in relay path.
+  - [OPEN] Relay attestations: spec includes proposer signatures per entry and domain-separated signatures; `ledger/src/mcp_attestation.rs` omits proposer_signature and has different signing rules.
+  - [OPEN] Transaction layout: spec defines a new header with `transaction_config_mask` and `target_proposer` as u32; no SDK/runtime support exists and code still uses `Pubkey`.
+  - [OPEN] Consensus payload/voting/replay: spec defines `McpBlockV1`, `McpVoteV1`, and `computeImpliedBlocks`; no corresponding runtime integration exists.
+  - [OPEN] Storage schema: spec suggests `McpShred`/`McpRelayAttestation`/`McpBlock`; code uses different column families and does not store MCP data.
 - API compatibility concerns:
-  - Shred header size change not consistently handled; legacy shreds and merkle offsets are inconsistent.
+  - MCP transaction format changes are not wired into SDK/runtime; external clients would be incompatible with current nodes.
+  - Legacy `Shred` format vs `McpShredV1` is unresolved; no versioning/feature gating in the pipeline.
 - Dependency changes:
-  - No new dependencies; new modules use existing crates.
+  - No new dependencies; MCP types live in existing crates.
 - Performance/regression risks:
-  - [FIXED] Bankless batch deserialization now has bounds checks (MAX_TRANSACTIONS_PER_BATCH, MAX_TRANSACTION_SIZE, MAX_BATCH_SIZE).
-  - [FIXED] Witness vectors now limited to MAX_WITNESS_BYTES (160 bytes, 8 entries).
-  - [FIXED] Schedule generation uses modular indexing to avoid duplicates per slot.
+  - Missing call sites mean witness limits, batch size limits, and fee checks are not enforced in the real pipeline.
+  - Relay/proposer message parsing remains variable-length and unbounded in turbine paths, risking DoS once integrated.
 
 ## Commands run + results (this iteration)
-- `git rev-parse --show-toplevel`
-  - Result: /home/anatoly/mcp
-- `git status --porcelain=v1`
-  - Result: `?? codex.md`
-- `git branch --show-current`
-  - Result: master
-- `git remote -v`
-  - Result: origin set; upstream added
-- `git fetch upstream --prune`
-  - Result: success
-- `curl -sL "https://api.github.com/repos/anza-xyz/mcp/issues?state=open&per_page=100"`
-  - Result: fetched 19 open issues (unauthenticated)
-- `git rev-list --reverse 19c13464f132644cea6ce91043b69d589cf7e7f2..HEAD`
-  - Result: 1 new commit (2952d2ec84)
-- `git show --name-status --stat 2952d2ec84d311cff8f997c5116183fd261f7c18`
-  - Result: adds `mcp_spec.md` (624 lines)
-- `git show 2952d2ec84d311cff8f997c5116183fd261f7c18`
-  - Result: documentation-only spec; no code changes
-- `git diff --stat upstream/master..HEAD`
-  - Result: 24 files changed, 6586 insertions, 11 deletions
-- `git diff upstream/master..HEAD | rg -n "TODO|FIXME|HACK|unwrap\(|expect\(|panic!|unsafe|allow\(|deny\(|skip|ignored|only\s+in\s+test|password|token|secret"`
-  - Result: no high-risk patterns beyond test unwraps and column key parsing
-- `cargo fmt --check`
-  - Result: failed; nightly rustfmt options unsupported and formatting diffs reported
-- `git fetch --all --prune`
-  - Result: success
-- `rg -o --no-line-number "<!-- CODEX_LAST_AUDITED: ([0-9a-f]+) -->" -r '$1' codex.md | tail -n 1`
-  - Result: ca7621467a1334fb702fe034b7ddb5495b27f87d
-- `git rev-list --reverse ca7621467a1334fb702fe034b7ddb5495b27f87d..HEAD`
-  - Result: no new commits
-- `rg -n "replay_stage|window_service|broadcast_stage|turbine" core/src turbine/src ledger/src`
-  - Result: located Agave integration points for MCP
-- `git fetch --all --prune`
-  - Result: success
-- `rg -o --no-line-number "<!-- CODEX_LAST_AUDITED: ([0-9a-f]+) -->" -r '$1' codex.md | tail -n 1`
-  - Result: ca7621467a1334fb702fe034b7ddb5495b27f87d
-- `git rev-list --reverse ca7621467a1334fb702fe034b7ddb5495b27f87d..HEAD`
-  - Result: 1 new commit (c5f4a1fabc)
-- `git show --name-status --stat c5f4a1fabc59fffab7641c96b4293e70b7ba8a6c`
-  - Result: spec-only update
-- `git show c5f4a1fabc59fffab7641c96b4293e70b7ba8a6c`
-  - Result: updates `mcp_spec.md` with new wire formats and primitives
-- `git fetch --all --prune`
-  - Result: success
-- `rg -o --no-line-number "<!-- CODEX_LAST_AUDITED: ([0-9a-f]+) -->" -r '$1' codex.md | tail -n 1`
-  - Result: 939aeba6dedf1bf7427647b2e4bc83a17ffe9cfd
-- `git rev-list --reverse 939aeba6dedf1bf7427647b2e4bc83a17ffe9cfd..HEAD`
-  - Result: no new commits
-- `rg -n "" mcp_spec.md`
-  - Result: re-scanned spec for correctness/completeness
-- `git fetch --all --prune`
-  - Result: success
-- `rg -o --no-line-number "<!-- CODEX_LAST_AUDITED: ([0-9a-f]+) -->" -r '$1' codex.md | tail -n 1`
-  - Result: 939aeba6dedf1bf7427647b2e4bc83a17ffe9cfd
-- `git rev-list --reverse 939aeba6dedf1bf7427647b2e4bc83a17ffe9cfd..HEAD`
-  - Result: 1 new commit (ca7621467a)
-- `git show --name-status --stat ca7621467a1334fb702fe034b7ddb5495b27f87d`
-  - Result: spec + multiple code changes
-- `git show ca7621467a1334fb702fe034b7ddb5495b27f87d -- mcp_spec.md`
-  - Result: spec updated with batch limits, signature binding, and verification rules
-- `cargo fmt --check`
-  - Result: failed; nightly rustfmt options unsupported and formatting diffs reported
-- `rg -n "" mcp_spec.md`
-  - Result: re-scanned spec for correctness/completeness
-- `git fetch --all --prune`
-  - Result: success
-- `curl -sL "https://api.github.com/repos/anza-xyz/mcp/issues?state=open&per_page=100"`
-  - Result: refreshed open issues (unauthenticated)
-- `git rev-list --reverse 2952d2ec84d311cff8f997c5116183fd261f7c18..HEAD`
-  - Result: 1 new commit (939aeba6de)
-- `git show --name-status --stat 939aeba6dedf1bf7427647b2e4bc83a17ffe9cfd`
-  - Result: `mcp_spec.md` updated
-- `git show 939aeba6dedf1bf7427647b2e4bc83a17ffe9cfd`
-  - Result: documentation-only update; no code changes
-- `git diff --stat upstream/master..HEAD`
-  - Result: 24 files changed, 6625 insertions, 11 deletions
-- `git diff upstream/master..HEAD | rg -n "TODO|FIXME|HACK|unwrap\(|expect\(|panic!|unsafe|allow\(|deny\(|skip|ignored|only\s+in\s+test|password|token|secret"`
-  - Result: no high-risk patterns beyond test unwraps and column key parsing
-- `cargo fmt --check`
-  - Result: failed; nightly rustfmt options unsupported and formatting diffs reported
+- `ls`
+  - Result: listed repository root contents.
+- `rg --files -g '*issue*' -g '*ISSUE*'`
+  - Result: no matching files.
+- `sed -n '1,200p' mcp_spec.md`
+  - Result: reviewed MCP spec header and constants.
+- `sed -n '1,200p' codex_audit.sh`
+  - Result: reviewed audit script behavior.
+- `rg -n "issue" -S docs mcp_spec.md README.md codex.md`
+  - Result: located prior issue snapshot in `codex.md`.
+- `sed -n '1,220p' codex.md`
+  - Result: reviewed prior audit content.
+- `git log --oneline -n 20`
+  - Result: identified new commits since last audit.
+- `git show --stat fbe9f1e5b4`
+  - Result: MCP fixes in standalone modules.
+- `git show --stat 062618c036`
+  - Result: codex.md update only.
+- `git show --stat addb78f334`
+  - Result: MCP modules removed (later reverted).
+- `git show --stat 19d3a4ab6c`
+  - Result: revert of removal.
+- `git show --stat efe05fc3cc`
+  - Result: MCP types moved into existing modules; core MCP modules removed.
+- `git show --stat d3f8032859`
+  - Result: replaced `mcp_spec.md`.
+- `sed -n '1,220p' ledger/src/mcp.rs`
+  - Result: reviewed MCP constants and transaction config types.
+- `rg -n "Mcp|mcp" ledger/src/leader_schedule.rs`
+  - Result: located MCP schedule integration.
+- `sed -n '1,220p' ledger/src/leader_schedule.rs`
+  - Result: reviewed MCP schedule logic.
+- `rg -n "MCP|Mcp|mcp" turbine/src/broadcast_stage.rs`
+  - Result: located MCP proposer types.
+- `sed -n '1,260p' turbine/src/broadcast_stage.rs`
+  - Result: reviewed proposer relay message layout.
+- `rg -n "MCP|mcp|RelayShred" turbine/src/sigverify_shreds.rs`
+  - Result: located MCP relay processor types.
+- `sed -n '600,900p' turbine/src/sigverify_shreds.rs`
+  - Result: reviewed relay shred processing logic.
+- `rg -n "McpFee|fee payer|mcp" svm/src/account_loader.rs`
+  - Result: located MCP fee payer helpers.
+- `sed -n '1,220p' svm/src/account_loader.rs`
+  - Result: reviewed MCP fee payer and fee-phase types.
+- `rg -n "mcp_attestation" -S core ledger turbine svm`
+  - Result: only `ledger/src/mcp_attestation.rs` is present.
+- `sed -n '1,220p' ledger/src/mcp_attestation.rs`
+  - Result: reviewed relay attestation wire format.
+- `rg -n "committee|rotation|schedule" mcp_spec.md`
+  - Result: located spec committee rules.
+- `sed -n '450,620p' mcp_spec.md`
+  - Result: reviewed transaction format and proposer/relay ops.
+- `rg -n "Merkle" mcp_spec.md`
+  - Result: located Merkle proof spec.
+- `sed -n '220,320p' mcp_spec.md`
+  - Result: reviewed Merkle and RS encoding spec.
+- `sed -n '720,820p' mcp_spec.md`
+  - Result: reviewed storage schema and security notes.
+- `date -u +\"%Y-%m-%dT%H:%M:%SZ\"`
+  - Result: 2026-01-22T21:14:43Z
+- `date -u +\"%Y-%m-%dT%H:%M:%SZ\"`
+  - Result: 2026-01-23T01:59:11Z
+- `date -u +\"%Y-%m-%dT%H:%M:%SZ\"`
+  - Result: 2026-01-23T02:47:38Z
+- `date -u +\"%Y-%m-%dT%H:%M:%SZ\"`
+  - Result: 2026-01-23T03:32:23Z

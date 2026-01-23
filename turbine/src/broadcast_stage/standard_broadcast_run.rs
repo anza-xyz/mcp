@@ -5,13 +5,16 @@ use {
         broadcast_utils::{self, ReceiveResults},
         *,
     },
-    crate::cluster_nodes::ClusterNodesCache,
+    crate::cluster_nodes::{
+        get_mcp_proposer_id, get_mcp_relay_targets, ClusterNodesCache, McpRelayTarget,
+    },
     crossbeam_channel::Sender,
     solana_entry::block_component::BlockComponent,
     solana_hash::Hash,
     solana_keypair::Keypair,
     solana_ledger::{
         blockstore_meta::BlockLocation,
+        leader_schedule_cache::LeaderScheduleCache,
         shred::{
             ProcessShredsStats, ReedSolomonCache, Shred, ShredType, Shredder,
             MAX_CODE_SHREDS_PER_SLOT, MAX_DATA_SHREDS_PER_SLOT,
@@ -49,6 +52,8 @@ pub struct StandardBroadcastRun {
     cluster_nodes_cache: Arc<ClusterNodesCache<BroadcastStage>>,
     reed_solomon_cache: Arc<ReedSolomonCache>,
     migration_status: Arc<MigrationStatus>,
+    // MCP proposer distribution support
+    leader_schedule_cache: Arc<LeaderScheduleCache>,
 }
 
 #[derive(Debug)]
@@ -57,7 +62,11 @@ enum BroadcastError {
 }
 
 impl StandardBroadcastRun {
-    pub(super) fn new(shred_version: u16, migration_status: Arc<MigrationStatus>) -> Self {
+    pub(super) fn new(
+        shred_version: u16,
+        migration_status: Arc<MigrationStatus>,
+        leader_schedule_cache: Arc<LeaderScheduleCache>,
+    ) -> Self {
         let cluster_nodes_cache = Arc::new(ClusterNodesCache::<BroadcastStage>::new(
             CLUSTER_NODES_CACHE_NUM_EPOCH_CAP,
             CLUSTER_NODES_CACHE_TTL,
@@ -82,6 +91,7 @@ impl StandardBroadcastRun {
             cluster_nodes_cache,
             reed_solomon_cache: Arc::<ReedSolomonCache>::default(),
             migration_status,
+            leader_schedule_cache,
         }
     }
 
@@ -507,6 +517,42 @@ impl StandardBroadcastRun {
 
         transmit_stats.num_shreds = shreds.len();
 
+        // Check if this node is an MCP proposer and should use MCP distribution
+        if let Some(first_shred) = shreds.first() {
+            let slot = first_shred.slot();
+            let my_pubkey = cluster_info.id();
+            let bank = bank_forks.read().ok().and_then(|bf| {
+                bf.get(slot).or_else(|| Some(bf.working_bank()))
+            });
+
+            if let Some(proposer_id) = self.get_mcp_proposer_id_for_slot(
+                slot,
+                &my_pubkey,
+                bank.as_ref().map(|b| b.as_ref()),
+            ) {
+                // This node is an MCP proposer - send directly to relays
+                let relay_targets = self.get_mcp_relay_targets_for_slot(
+                    slot,
+                    cluster_info,
+                    bank.as_ref().map(|b| b.as_ref()),
+                );
+
+                if !relay_targets.is_empty() {
+                    if let BroadcastSocket::Udp(udp_sock) = sock {
+                        let _ = self.try_mcp_broadcast(
+                            udp_sock,
+                            slot,
+                            proposer_id,
+                            &shreds,
+                            &relay_targets,
+                            &mut transmit_stats,
+                        );
+                    }
+                }
+            }
+        }
+
+        // Standard turbine broadcast (in addition to MCP distribution)
         broadcast_shreds(
             sock,
             &shreds,
@@ -534,6 +580,104 @@ impl StandardBroadcastRun {
     ) {
         let mut transmit_shreds_stats = self.transmit_shreds_stats.lock().unwrap();
         transmit_shreds_stats.update(new_transmit_shreds_stats, broadcast_shred_batch_info);
+    }
+
+    // ========================================================================
+    // MCP (Multiple Concurrent Proposers) Proposer Distribution
+    // ========================================================================
+
+    /// Check if this node is an MCP proposer for the given slot.
+    /// Returns the proposer ID if this node is a proposer, None otherwise.
+    fn get_mcp_proposer_id_for_slot(
+        &self,
+        slot: Slot,
+        my_pubkey: &Pubkey,
+        bank: Option<&Bank>,
+    ) -> Option<u8> {
+        get_mcp_proposer_id(my_pubkey, slot, &self.leader_schedule_cache, bank)
+    }
+
+    /// Get MCP relay targets for broadcasting shreds.
+    /// Returns empty vec if MCP schedule is not available.
+    fn get_mcp_relay_targets_for_slot(
+        &self,
+        slot: Slot,
+        cluster_info: &ClusterInfo,
+        bank: Option<&Bank>,
+    ) -> Vec<McpRelayTarget> {
+        let Some(bank) = bank else {
+            return Vec::new();
+        };
+        let cluster_nodes = self.cluster_nodes_cache.get(
+            slot,
+            bank,
+            bank,
+            cluster_info,
+        );
+        get_mcp_relay_targets(
+            slot,
+            &cluster_nodes,
+            &self.leader_schedule_cache,
+            Some(bank),
+            cluster_info.socket_addr_space(),
+        )
+    }
+
+    /// Broadcast shreds using MCP proposer distribution (direct to relays).
+    /// Returns Ok(true) if MCP distribution was used, Ok(false) if not an MCP proposer.
+    fn try_mcp_broadcast(
+        &mut self,
+        sock: &UdpSocket,
+        slot: Slot,
+        proposer_id: u8,
+        shreds: &[Shred],
+        relay_targets: &[McpRelayTarget],
+        _transmit_stats: &mut TransmitShredsStats,
+    ) -> std::result::Result<bool, Error> {
+        if relay_targets.is_empty() {
+            // No relay targets available, fall back to standard broadcast
+            return Ok(false);
+        }
+
+        // MCP proposers send each shred to its designated relay
+        // Per MCP spec §9.1: relay_id = shred_index % NUM_RELAYS
+        for shred in shreds {
+            let shred_index = shred.index();
+            let relay_index = (shred_index as u16) % solana_ledger::mcp::NUM_RELAYS;
+
+            // Find the relay target for this shred
+            if let Some(relay) = relay_targets.iter().find(|r| r.relay_id == relay_index) {
+                if let Some(addr) = relay.tvu_addr {
+                    // Send the shred payload to the relay
+                    // Note: In full implementation, this would create McpShredV1 format
+                    // For now, send the standard shred payload
+                    if let Err(e) = sock.send_to(shred.payload().as_ref(), addr) {
+                        debug!(
+                            "MCP broadcast to relay {} at {} failed: {}",
+                            relay_index, addr, e
+                        );
+                    } else {
+                        trace!(
+                            "MCP broadcast shred {} to relay {} ({}) at {}",
+                            shred_index,
+                            relay_index,
+                            relay.pubkey,
+                            addr
+                        );
+                    }
+                }
+            }
+        }
+
+        info!(
+            "MCP proposer {} broadcast {} shreds to {} relays for slot {}",
+            proposer_id,
+            shreds.len(),
+            relay_targets.len(),
+            slot
+        );
+
+        Ok(true)
     }
 
     fn report_and_reset_stats(&mut self, was_interrupted: bool) {
