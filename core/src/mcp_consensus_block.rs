@@ -340,40 +340,94 @@ impl McpBlockV1 {
     /// 4. Tie-break by lexicographically smallest commitment
     /// 5. Only include if count >= MIN_RELAYS_PER_PROPOSER (80)
     ///
+    /// Note: This version does not verify proposer signatures. Use
+    /// `compute_implied_blocks_with_verification` for full signature verification.
+    ///
     /// Returns: list of (proposer_id, commitment) pairs that are implied
     pub fn compute_implied_blocks(&self) -> Vec<(u8, Hash)> {
+        self.compute_implied_blocks_impl(None)
+    }
+
+    /// Compute implied blocks with proposer signature verification.
+    ///
+    /// Same as `compute_implied_blocks` but also verifies that each proposer's
+    /// signature over their commitment is valid. Invalid signatures are treated
+    /// as if the attestation didn't exist.
+    ///
+    /// Per spec §11.2: The proposer signature is verified against the signing
+    /// message: "mcp:commitment:v1" || LE64(slot) || LE32(proposer_index) || commitment32
+    ///
+    /// Returns: list of (proposer_id, commitment) pairs that are implied
+    pub fn compute_implied_blocks_with_verification(
+        &self,
+        proposer_pubkeys: &[solana_pubkey::Pubkey],
+    ) -> Vec<(u8, Hash)> {
+        self.compute_implied_blocks_impl(Some(proposer_pubkeys))
+    }
+
+    /// Internal implementation of compute_implied_blocks with optional signature verification.
+    fn compute_implied_blocks_impl(
+        &self,
+        proposer_pubkeys: Option<&[solana_pubkey::Pubkey]>,
+    ) -> Vec<(u8, Hash)> {
         // Minimum attestations required per proposer (40% of 200 = 80)
         const MIN_RELAYS_PER_PROPOSER: usize = 80;
 
-        // Track all commitments seen for each proposer
-        let mut proposer_commitments: HashMap<u8, HashMap<Hash, usize>> = HashMap::new();
+        // Track all commitments seen for each proposer, along with valid signatures
+        // Map: proposer_id -> commitment -> (count, has_valid_signature)
+        let mut proposer_commitments: HashMap<u8, HashMap<Hash, (usize, bool)>> = HashMap::new();
 
         for relay_entry in &self.relay_entries {
             for entry in &relay_entry.entries {
-                *proposer_commitments
-                    .entry(entry.proposer_index)
+                let proposer_id = entry.proposer_index;
+
+                // Check signature validity if proposer_pubkeys provided
+                let sig_valid = if let Some(pubkeys) = proposer_pubkeys {
+                    if (proposer_id as usize) < pubkeys.len() {
+                        entry.verify_proposer_signature(
+                            &pubkeys[proposer_id as usize],
+                            self.slot,
+                        )
+                    } else {
+                        false // Invalid proposer_id
+                    }
+                } else {
+                    true // No verification requested, assume valid
+                };
+
+                let entry_data = proposer_commitments
+                    .entry(proposer_id)
                     .or_default()
                     .entry(entry.commitment)
-                    .or_default() += 1;
+                    .or_insert((0, false));
+
+                entry_data.0 += 1;
+                if sig_valid {
+                    entry_data.1 = true;
+                }
             }
         }
 
         let mut implied_blocks = Vec::new();
 
-        for (proposer_id, commitment_counts) in proposer_commitments {
+        for (proposer_id, commitment_data) in proposer_commitments {
+            // Filter to only commitments with valid signatures (if verification was requested)
+            let valid_commitments: Vec<(Hash, usize)> = commitment_data
+                .into_iter()
+                .filter(|(_, (_, has_valid_sig))| *has_valid_sig)
+                .map(|(commitment, (count, _))| (commitment, count))
+                .collect();
+
             // Check for equivocation: if there are 2+ different commitments
-            // with any attestation support, the proposer is equivocating
-            // Note: In a full implementation we'd also verify the proposer
-            // signatures, but for now we assume attestations are valid
-            if commitment_counts.len() > 1 {
+            // with valid signatures, the proposer is equivocating
+            if valid_commitments.len() > 1 {
                 // Proposer equivocation detected - exclude this proposer
-                // (All commitments have at least 1 attestation by definition)
                 continue;
             }
 
             // Find the commitment with max support, tie-break by lex order
             let mut best: Option<(Hash, usize)> = None;
-            for (commitment, count) in commitment_counts {
+            for (commitment, count) in valid_commitments {
                 match &best {
                     None => best = Some((commitment, count)),
                     Some((best_commitment, best_count)) => {

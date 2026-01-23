@@ -264,6 +264,11 @@ pub struct Blockstore {
     mcp_code_shred_cf: LedgerColumn<cf::McpShredCode>,
     #[allow(dead_code)] // Will be used for MCP shred storage
     mcp_data_shred_cf: LedgerColumn<cf::McpShredData>,
+    // MCP consensus and execution columns
+    #[allow(dead_code)] // Will be used for MCP consensus storage
+    mcp_consensus_payload_cf: LedgerColumn<cf::McpConsensusPayload>,
+    #[allow(dead_code)] // Will be used for MCP execution output storage
+    mcp_execution_output_cf: LedgerColumn<cf::McpExecutionOutput>,
     dead_slots_cf: LedgerColumn<cf::DeadSlots>,
     duplicate_slots_cf: LedgerColumn<cf::DuplicateSlots>,
     erasure_meta_cf: LedgerColumn<cf::ErasureMeta>,
@@ -450,6 +455,8 @@ impl Blockstore {
         // MCP (Multiple Concurrent Proposers) shred columns
         let mcp_code_shred_cf = db.column();
         let mcp_data_shred_cf = db.column();
+        let mcp_consensus_payload_cf = db.column();
+        let mcp_execution_output_cf = db.column();
         let dead_slots_cf = db.column();
         let duplicate_slots_cf = db.column();
         let erasure_meta_cf = db.column();
@@ -493,6 +500,8 @@ impl Blockstore {
             data_shred_cf,
             mcp_code_shred_cf,
             mcp_data_shred_cf,
+            mcp_consensus_payload_cf,
+            mcp_execution_output_cf,
             dead_slots_cf,
             duplicate_slots_cf,
             erasure_meta_cf,
@@ -3298,6 +3307,27 @@ impl Blockstore {
             }
         }
         false
+    }
+
+    /// Store an MCP consensus payload (McpBlockV1 serialized).
+    /// Per MCP spec §11.1: The consensus leader writes the block after gathering attestations.
+    pub fn put_mcp_consensus_payload(&self, slot: Slot, block_hash: Hash, payload: &[u8]) -> Result<()> {
+        self.mcp_consensus_payload_cf.put_bytes((slot, block_hash), payload)
+    }
+
+    /// Get an MCP consensus payload by slot and block hash.
+    pub fn get_mcp_consensus_payload(&self, slot: Slot, block_hash: Hash) -> Result<Option<Vec<u8>>> {
+        self.mcp_consensus_payload_cf.get_bytes((slot, block_hash))
+    }
+
+    /// Store an MCP execution output (per spec §13: slot + output data).
+    pub fn put_mcp_execution_output(&self, slot: Slot, block_hash: Hash, output: &[u8]) -> Result<()> {
+        self.mcp_execution_output_cf.put_bytes((slot, block_hash), output)
+    }
+
+    /// Get an MCP execution output by slot and block hash.
+    pub fn get_mcp_execution_output(&self, slot: Slot, block_hash: Hash) -> Result<Option<Vec<u8>>> {
+        self.mcp_execution_output_cf.get_bytes((slot, block_hash))
     }
 
     // Only used by tests

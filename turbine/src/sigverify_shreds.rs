@@ -917,7 +917,7 @@ pub fn try_parse_mcp_shred(packet: &[u8]) -> Option<McpShredV1> {
 /// 1. Verify slot and shred_index match expected relay assignment
 /// 2. Verify proposer_index is in range [0, NUM_PROPOSERS-1]
 /// 3. Verify proposer signature over (slot, proposer_index, commitment)
-/// 4. Verify Merkle witness (TODO: implement Merkle verification)
+/// 4. Verify Merkle witness for shred_data at index shred_index yields commitment
 pub fn verify_mcp_shred(
     packet: &[u8],
     my_relay_id: Option<u16>,

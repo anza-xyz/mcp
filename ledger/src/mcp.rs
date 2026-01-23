@@ -18,7 +18,6 @@
 //!   reconstruct a proposer's batch (20%)
 
 use {
-    solana_pubkey::Pubkey,
     solana_votor_messages::fraction::Fraction,
     std::io::{self, Read, Write},
 };
@@ -232,11 +231,11 @@ pub mod transaction {
     /// fee fields and targeting options. When serialized, only non-default
     /// fields are included, prefixed by a config mask byte.
     ///
-    /// # Serialization Format
+    /// # Serialization Format (per MCP spec §7)
     ///
     /// ```text
     /// | config_mask (1 byte) | inclusion_fee (8 bytes, optional) |
-    /// | ordering_fee (8 bytes, optional) | target_proposer (32 bytes, optional) |
+    /// | ordering_fee (8 bytes, optional) | target_proposer (4 bytes, optional) |
     /// ```
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
     pub struct McpTransactionConfig {
@@ -253,12 +252,13 @@ pub mod transaction {
         /// proposer's batch. Paid in lamports.
         pub ordering_fee: u64,
 
-        /// Optional target proposer ID.
+        /// Optional target proposer index.
         ///
         /// If set, the transaction should only be processed by the specified
-        /// proposer. This allows users to select a specific proposer for
-        /// their transactions. If `None`, any proposer may include it.
-        pub target_proposer: Option<Pubkey>,
+        /// proposer (by index in the proposer schedule, 0 to NUM_PROPOSERS-1).
+        /// This allows users to select a specific proposer for their transactions.
+        /// If `None`, any proposer may include it.
+        pub target_proposer: Option<u32>,
     }
 
     impl McpTransactionConfig {
@@ -272,10 +272,11 @@ pub mod transaction {
         }
 
         /// Create a new MCP transaction config targeting a specific proposer.
+        /// Per MCP spec §7, target_proposer is an index (0 to NUM_PROPOSERS-1).
         pub const fn with_target_proposer(
             inclusion_fee: u64,
             ordering_fee: u64,
-            target_proposer: Pubkey,
+            target_proposer: u32,
         ) -> Self {
             Self {
                 inclusion_fee,
@@ -321,9 +322,9 @@ pub mod transaction {
                 bytes_written += 8;
             }
             if mask & config_mask::TARGET_PROPOSER != 0 {
-                if let Some(pubkey) = &self.target_proposer {
-                    writer.write_all(pubkey.as_ref())?;
-                    bytes_written += 32;
+                if let Some(proposer_index) = &self.target_proposer {
+                    writer.write_all(&proposer_index.to_le_bytes())?;
+                    bytes_written += 4;
                 }
             }
 
@@ -353,9 +354,9 @@ pub mod transaction {
             };
 
             let target_proposer = if mask & config_mask::TARGET_PROPOSER != 0 {
-                let mut buf = [0u8; 32];
+                let mut buf = [0u8; 4];
                 reader.read_exact(&mut buf)?;
-                Some(Pubkey::from(buf))
+                Some(u32::from_le_bytes(buf))
             } else {
                 None
             };
@@ -378,7 +379,7 @@ pub mod transaction {
                 size += 8;
             }
             if mask & config_mask::TARGET_PROPOSER != 0 {
-                size += 32;
+                size += 4; // u32 proposer index per MCP spec §7
             }
             size
         }
@@ -470,9 +471,9 @@ pub mod transaction {
 
         #[test]
         fn test_config_with_target_proposer() {
-            let proposer = Pubkey::new_unique();
-            let config = McpTransactionConfig::with_target_proposer(100, 50, proposer);
-            assert_eq!(config.target_proposer, Some(proposer));
+            let proposer_index = 5u32;
+            let config = McpTransactionConfig::with_target_proposer(100, 50, proposer_index);
+            assert_eq!(config.target_proposer, Some(proposer_index));
             assert_eq!(
                 config.config_mask(),
                 config_mask::INCLUSION_FEE
@@ -483,8 +484,8 @@ pub mod transaction {
 
         #[test]
         fn test_serialization_roundtrip() {
-            let proposer = Pubkey::new_unique();
-            let original = McpTransactionConfig::with_target_proposer(1000, 500, proposer);
+            let proposer_index = 12u32;
+            let original = McpTransactionConfig::with_target_proposer(1000, 500, proposer_index);
 
             let mut buffer = Vec::new();
             let written = original.serialize(&mut buffer).unwrap();
