@@ -634,6 +634,8 @@ impl<FG: ForkGraph> TransactionBatchProcessor<FG> {
         // In MCP, the same transaction may be included by multiple proposers, so the
         // fee payer needs enough balance to cover fees for all proposers (NUM_PROPOSERS = 16).
         // This check uses post-fee balance to ensure sufficient reserves.
+        // Per MCP spec §10.2: Reject transactions where the fee payer cannot cover
+        // fees for inclusion by all proposers.
         let is_nonce = nonce.is_some();
         if let Err(mcp_err) = validate_mcp_fee_payer(
             &loaded_fee_payer.account,
@@ -641,15 +643,12 @@ impl<FG: ForkGraph> TransactionBatchProcessor<FG> {
             rent,
             is_nonce,
         ) {
-            // Log MCP fee validation failure but don't fail the transaction yet
-            // This allows gradual rollout of MCP fee requirements
             debug!(
-                "MCP fee payer validation warning for {}: {:?}",
+                "MCP fee payer validation failed for {}: {:?}",
                 fee_payer_address, mcp_err
             );
-            // TODO: Once MCP is fully activated, this should return an error:
-            // error_counters.insufficient_funds += 1;
-            // return Err(TransactionError::InsufficientFundsForFee);
+            error_counters.insufficient_funds += 1;
+            return Err(TransactionError::InsufficientFundsForFee);
         }
 
         // Capture fee-subtracted fee payer account and next nonce account state

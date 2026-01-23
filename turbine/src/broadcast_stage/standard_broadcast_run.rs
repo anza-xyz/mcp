@@ -15,13 +15,16 @@ use {
     solana_ledger::{
         blockstore_meta::BlockLocation,
         leader_schedule_cache::LeaderScheduleCache,
+        mcp_merkle::{McpMerkleTree, LEAF_PAYLOAD_SIZE},
         shred::{
+            mcp_shred::{McpShredV1, MCP_SHRED_PAYLOAD_BYTES, MCP_SHRED_TOTAL_BYTES},
             ProcessShredsStats, ReedSolomonCache, Shred, ShredType, Shredder,
             MAX_CODE_SHREDS_PER_SLOT, MAX_DATA_SHREDS_PER_SLOT,
         },
     },
     solana_runtime::bank::Bank,
     solana_sha256_hasher::hashv,
+    solana_signature::Signer,
     solana_time_utils::AtomicInterval,
     solana_votor::event::VotorEventSender,
     solana_votor_messages::migration::MigrationStatus,
@@ -539,12 +542,14 @@ impl StandardBroadcastRun {
 
                 if !relay_targets.is_empty() {
                     if let BroadcastSocket::Udp(udp_sock) = sock {
+                        let keypair = cluster_info.keypair();
                         let _ = self.try_mcp_broadcast(
                             udp_sock,
                             slot,
                             proposer_id,
                             &shreds,
                             &relay_targets,
+                            &keypair,
                             &mut transmit_stats,
                         );
                     }
@@ -625,6 +630,12 @@ impl StandardBroadcastRun {
 
     /// Broadcast shreds using MCP proposer distribution (direct to relays).
     /// Returns Ok(true) if MCP distribution was used, Ok(false) if not an MCP proposer.
+    ///
+    /// This function encodes shreds in the McpShredV1 wire format with:
+    /// - Merkle commitment over all shreds
+    /// - Per-shred Merkle witness (proof)
+    /// - Proposer signature over the commitment
+    #[allow(clippy::too_many_arguments)]
     fn try_mcp_broadcast(
         &mut self,
         sock: &UdpSocket,
@@ -632,6 +643,7 @@ impl StandardBroadcastRun {
         proposer_id: u8,
         shreds: &[Shred],
         relay_targets: &[McpRelayTarget],
+        keypair: &Keypair,
         _transmit_stats: &mut TransmitShredsStats,
     ) -> std::result::Result<bool, Error> {
         if relay_targets.is_empty() {
@@ -639,26 +651,70 @@ impl StandardBroadcastRun {
             return Ok(false);
         }
 
-        // MCP proposers send each shred to its designated relay
-        // Per MCP spec §9.1: relay_id = shred_index % NUM_RELAYS
+        if shreds.is_empty() {
+            return Ok(false);
+        }
+
+        // Step 1: Extract payloads and pad to MCP_SHRED_PAYLOAD_BYTES (952 bytes)
+        // Per spec §6.1, each shred payload must be exactly 952 bytes
+        let mut payloads: Vec<[u8; MCP_SHRED_PAYLOAD_BYTES]> = Vec::with_capacity(shreds.len());
         for shred in shreds {
+            let raw_payload = shred.payload();
+            let mut padded = [0u8; MCP_SHRED_PAYLOAD_BYTES];
+            let copy_len = raw_payload.len().min(MCP_SHRED_PAYLOAD_BYTES);
+            padded[..copy_len].copy_from_slice(&raw_payload[..copy_len]);
+            payloads.push(padded);
+        }
+
+        // Step 2: Build Merkle tree from payloads to generate commitment and witnesses
+        // The tree has 256 leaves; we pad with zeros if fewer shreds
+        let payload_refs: Vec<&[u8]> = payloads.iter().map(|p| p.as_slice()).collect();
+        let merkle_tree = McpMerkleTree::from_payloads(&payload_refs);
+        let commitment = merkle_tree.commitment();
+
+        // Step 3: Create and sign the commitment message
+        // Per spec §5.2: proposer_sig_msg = "mcp:commitment:v1" || slot || proposer_index || commitment
+        let mut sig_msg = Vec::with_capacity(17 + 8 + 4 + 32);
+        sig_msg.extend_from_slice(b"mcp:commitment:v1");
+        sig_msg.extend_from_slice(&slot.to_le_bytes());
+        sig_msg.extend_from_slice(&(proposer_id as u32).to_le_bytes());
+        sig_msg.extend_from_slice(commitment.as_ref());
+        let proposer_signature = keypair.sign_message(&sig_msg);
+
+        // Step 4: Create McpShredV1 for each shred and send to designated relay
+        for (i, (shred, payload)) in shreds.iter().zip(payloads.iter()).enumerate() {
             let shred_index = shred.index();
             let relay_index = (shred_index as u16) % solana_ledger::mcp::NUM_RELAYS;
+
+            // Generate Merkle witness (proof) for this shred
+            let leaf_index = (i % 256) as u8;
+            let proof = merkle_tree.get_proof(leaf_index);
+
+            // Create McpShredV1
+            let mcp_shred = McpShredV1::new(
+                slot,
+                proposer_id as u32,
+                shred_index,
+                commitment.to_bytes(),
+                *payload,
+                proof.siblings,
+                proposer_signature,
+            );
+
+            // Serialize to wire format
+            let mcp_bytes = mcp_shred.to_bytes();
 
             // Find the relay target for this shred
             if let Some(relay) = relay_targets.iter().find(|r| r.relay_id == relay_index) {
                 if let Some(addr) = relay.tvu_addr {
-                    // Send the shred payload to the relay
-                    // Note: In full implementation, this would create McpShredV1 format
-                    // For now, send the standard shred payload
-                    if let Err(e) = sock.send_to(shred.payload().as_ref(), addr) {
+                    if let Err(e) = sock.send_to(&mcp_bytes, addr) {
                         debug!(
                             "MCP broadcast to relay {} at {} failed: {}",
                             relay_index, addr, e
                         );
                     } else {
                         trace!(
-                            "MCP broadcast shred {} to relay {} ({}) at {}",
+                            "MCP broadcast McpShredV1 {} to relay {} ({}) at {}",
                             shred_index,
                             relay_index,
                             relay.pubkey,
@@ -670,7 +726,7 @@ impl StandardBroadcastRun {
         }
 
         info!(
-            "MCP proposer {} broadcast {} shreds to {} relays for slot {}",
+            "MCP proposer {} broadcast {} McpShredV1 shreds to {} relays for slot {}",
             proposer_id,
             shreds.len(),
             relay_targets.len(),
