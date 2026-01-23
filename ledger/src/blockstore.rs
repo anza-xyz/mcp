@@ -269,6 +269,8 @@ pub struct Blockstore {
     mcp_consensus_payload_cf: LedgerColumn<cf::McpConsensusPayload>,
     #[allow(dead_code)] // Will be used for MCP execution output storage
     mcp_execution_output_cf: LedgerColumn<cf::McpExecutionOutput>,
+    #[allow(dead_code)] // Will be used for MCP relay attestation storage
+    mcp_relay_attestation_cf: LedgerColumn<cf::McpRelayAttestation>,
     dead_slots_cf: LedgerColumn<cf::DeadSlots>,
     duplicate_slots_cf: LedgerColumn<cf::DuplicateSlots>,
     erasure_meta_cf: LedgerColumn<cf::ErasureMeta>,
@@ -457,6 +459,7 @@ impl Blockstore {
         let mcp_data_shred_cf = db.column();
         let mcp_consensus_payload_cf = db.column();
         let mcp_execution_output_cf = db.column();
+        let mcp_relay_attestation_cf = db.column();
         let dead_slots_cf = db.column();
         let duplicate_slots_cf = db.column();
         let erasure_meta_cf = db.column();
@@ -502,6 +505,7 @@ impl Blockstore {
             mcp_data_shred_cf,
             mcp_consensus_payload_cf,
             mcp_execution_output_cf,
+            mcp_relay_attestation_cf,
             dead_slots_cf,
             duplicate_slots_cf,
             erasure_meta_cf,
@@ -3328,6 +3332,29 @@ impl Blockstore {
     /// Get an MCP execution output by slot and block hash.
     pub fn get_mcp_execution_output(&self, slot: Slot, block_hash: Hash) -> Result<Option<Vec<u8>>> {
         self.mcp_execution_output_cf.get_bytes((slot, block_hash))
+    }
+
+    /// Store an MCP relay attestation (per spec §12: slot + relay_index + attestation data).
+    pub fn put_mcp_relay_attestation(&self, slot: Slot, relay_index: u16, attestation: &[u8]) -> Result<()> {
+        self.mcp_relay_attestation_cf.put_bytes((slot, relay_index), attestation)
+    }
+
+    /// Get an MCP relay attestation by slot and relay index.
+    pub fn get_mcp_relay_attestation(&self, slot: Slot, relay_index: u16) -> Result<Option<Vec<u8>>> {
+        self.mcp_relay_attestation_cf.get_bytes((slot, relay_index))
+    }
+
+    /// Get all MCP relay attestations for a slot.
+    pub fn get_mcp_relay_attestations_for_slot(&self, slot: Slot) -> Result<Vec<(u16, Vec<u8>)>> {
+        let mut attestations = Vec::new();
+        let start_key = (slot, 0u16);
+        for ((s, relay_index), data) in self.mcp_relay_attestation_cf.iter(IteratorMode::From(start_key, IteratorDirection::Forward))? {
+            if s != slot {
+                break;
+            }
+            attestations.push((relay_index, data.to_vec()));
+        }
+        Ok(attestations)
     }
 
     // Only used by tests

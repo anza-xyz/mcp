@@ -368,6 +368,17 @@ pub mod columns {
     /// * index type: `(Slot, block_id: Hash)`
     /// * value type: `Vec<u8>` (serialized execution output)
     pub struct McpExecutionOutput;
+
+    #[derive(Debug)]
+    /// MCP relay attestation column.
+    ///
+    /// Stores relay attestations received from relays attesting to
+    /// proposer shred availability. Used by leaders to aggregate
+    /// attestations for consensus blocks.
+    ///
+    /// * index type: `(Slot, relay_index: u16)`
+    /// * value type: `Vec<u8>` (serialized RelayAttestationV1)
+    pub struct McpRelayAttestation;
 }
 
 macro_rules! convert_column_index_to_key_bytes {
@@ -1525,4 +1536,36 @@ impl Column for columns::McpExecutionOutput {
 
 impl ColumnName for columns::McpExecutionOutput {
     const NAME: &'static str = "mcp_execution_output";
+}
+
+// McpRelayAttestation: (Slot, relay_index: u16)
+impl Column for columns::McpRelayAttestation {
+    type Index = (Slot, /*relay_index:*/ u16);
+    type Key = [u8; std::mem::size_of::<Slot>() + std::mem::size_of::<u16>()];
+
+    #[inline]
+    fn key((slot, relay_index): &Self::Index) -> Self::Key {
+        let mut key = [0u8; 10]; // 8 + 2
+        key[0..8].copy_from_slice(&slot.to_be_bytes());
+        key[8..10].copy_from_slice(&relay_index.to_be_bytes());
+        key
+    }
+
+    fn index(key: &[u8]) -> Self::Index {
+        let slot = Slot::from_be_bytes(key[0..8].try_into().unwrap());
+        let relay_index = u16::from_be_bytes(key[8..10].try_into().unwrap());
+        (slot, relay_index)
+    }
+
+    fn slot(index: Self::Index) -> Slot {
+        index.0
+    }
+
+    fn as_index(slot: Slot) -> Self::Index {
+        (slot, 0)
+    }
+}
+
+impl ColumnName for columns::McpRelayAttestation {
+    const NAME: &'static str = "mcp_relay_attestation";
 }

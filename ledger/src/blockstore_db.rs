@@ -210,6 +210,7 @@ impl Rocks {
             new_cf_descriptor::<columns::McpIndex>(options, oldest_slot),
             new_cf_descriptor::<columns::McpConsensusPayload>(options, oldest_slot),
             new_cf_descriptor::<columns::McpExecutionOutput>(options, oldest_slot),
+            new_cf_descriptor::<columns::McpRelayAttestation>(options, oldest_slot),
         ];
 
         // If the access type is Secondary, we don't need to open all of the
