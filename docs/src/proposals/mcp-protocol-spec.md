@@ -65,6 +65,7 @@ Stages MAY be pipelined across slots, so a validator can execute different
 stages for different slots at the same time without changing the per-slot
 rules.
 
+Baseline (single-leader, non-MCP)
 ```text
 +-----------+    Txs    +--------+   Shreds  +-------+   Shreds   +---------------+
 | Client(s) | --------> | Leader | --------> | Relay | ---------> | Validator(s)  |<---+
@@ -77,7 +78,7 @@ rules.
 ```
 
 
-Constellation
+MCP (Constellation)
 ```text
 +-----------+    Txs    +----------+   Shreds  +-------+   Shreds   +--------------+
 | Client(s) | --------> | Proposer | --------> | Relay | ---------> | Validator(s) |<---+
@@ -110,6 +111,11 @@ proposer. An aggregate is the leader-collected set of relay attestations for a
 slot. An implied block is a proposer commitment that meets the inclusion rules
 in the aggregate.
 
+Validator identities in schedules are the validator node identity public keys.
+When the consensus leader schedule is vote-keyed, stake-weighted sampling is
+performed over vote account public keys and each selected vote account is mapped
+to its node identity public key for all scheduling and signature checks.
+
 All integers are little-endian. Signed integers are encoded in two's complement
 form of the given width. Unsigned integers are encoded in standard binary form.
 Byte strings are encoded as raw bytes with no length prefix unless specified.
@@ -125,24 +131,33 @@ Leader[s] as defined in Section 5 and initializes per-slot state for collecting
 shreds, attestations, and votes. The proposer batch payload is encoded as a u32
 count followed by that many (u32 length, transaction bytes) pairs, where each
 transaction bytes value is a Transaction message as defined in Section 7.1. Any
-trailing zero bytes added for padding MUST be ignored by decoders.
+trailing zero bytes added for padding MUST be ignored by decoders. Decoders MUST
+reject a payload if any length extends past the available bytes or if any
+remaining bytes after the final transaction are non-zero.
 
 3.2 Proposal Stage
 
 Each proposer collects pending transactions into a batch. Global block-level
 constraints on compute units (CU) and loaded account data are divided evenly
-among the proposers. The proposer then encodes the batch into NUM_RELAYS shreds
-using erasure coding with the parameters from Section 4. Each shred has
-SHRED_DATA_BYTES bytes. The serialized batch MUST NOT exceed
-NUM_RELAYS * SHRED_DATA_BYTES bytes so that the encoding yields exactly one shred
-per relay. The per-proposer CU and loaded account data limits MUST be set so that
-a batch that respects them can satisfy this size bound. The encoder MUST define
-shred indices from 0 to NUM_RELAYS-1 and MUST output shreds in that order. The
-proposer computes the Merkle commitment over all shreds, computes the witness for
-each shred index, and signs the commitment. The proposer MUST include the
-corresponding witness in each Shred message. The proposer MUST send exactly one
-Shred message to each relay in Relays[s], with shred_index equal to that relay's
-index, and MUST NOT send conflicting commitments for the same slot.
+among the proposers. Let CU_LIMIT and ACCOUNTS_DATA_LIMIT be the global limits
+for the slot under the underlying execution rules. Each proposer budget is
+floor(CU_LIMIT / NUM_PROPOSERS) and floor(ACCOUNTS_DATA_LIMIT / NUM_PROPOSERS),
+and any remainder is unused. A proposer batch MUST NOT exceed these per-proposer
+limits. A proposer MUST NOT include duplicate transactions within its batch, and
+transactions are duplicates if their serialized Transaction bytes are identical.
+Validators MUST treat any batch that violates these limits or includes
+duplicates as invalid and exclude that proposer. The proposer then encodes the
+batch into NUM_RELAYS shreds using erasure coding with the parameters from
+Section 4. Each shred has SHRED_DATA_BYTES bytes. The serialized batch MUST NOT
+exceed NUM_RELAYS * SHRED_DATA_BYTES bytes so that the encoding yields exactly
+one shred per relay. The per-proposer CU and loaded account data limits MUST be
+set so that a batch that respects them can satisfy this size bound. The encoder
+MUST define shred indices from 0 to NUM_RELAYS-1 and MUST output shreds in that
+order. The proposer computes the Merkle commitment over all shreds, computes the
+witness for each shred index, and signs the commitment. The proposer MUST
+include the corresponding witness in each Shred message. The proposer MUST send
+exactly one Shred message to each relay in Relays[s], with shred_index equal to
+that relay's index, and MUST NOT send conflicting commitments for the same slot.
 
 3.3 Relay and Retransmit Stage
 
@@ -151,31 +166,30 @@ proposer_index is in Proposers[s], that the proposer_signature verifies against
 the commitment, and that the witness verifies against the commitment for the
 relay's own index. If any check fails, the relay MUST discard the shred. If the
 checks pass, the relay stores the shred keyed by (slot, proposer_index,
-shred_index) and MUST broadcast the same Shred message to all validators. The
-relay MUST create at most one attestation entry per proposer per slot. If a
-relay receives multiple valid shreds that imply different commitments for the
-same proposer and slot, it SHOULD NOT attest to any of them. At the relay
-deadline for slot s, each relay constructs RelayAttestation v1 containing all
-valid proposer entries it accepted for the slot, sorted by proposer_index,
-signs it, and sends it to Leader[s]. Each relay MUST emit at most one
-RelayAttestation per slot. If additional shreds arrive after it has broadcast
-its attestation, it MUST NOT issue another RelayAttestation for that slot. The
-relay MUST include the proposer_signature received in each entry so that other
-nodes can verify the commitment without contacting the proposer.
+shred_index) and MUST retransmit the same Shred message unchanged over the
+network's standard broadcast mechanism. The relay MUST create at most one
+attestation entry per proposer per slot. If a relay receives multiple valid
+shreds that imply different commitments for the same proposer and slot, it MUST
+NOT attest to any of them. At the relay deadline for slot s, each relay
+constructs RelayAttestation v1 containing all valid proposer entries it
+accepted for the slot, sorted by proposer_index, signs it, and sends it to
+Leader[s]. Each relay MUST emit at most one RelayAttestation per slot. If
+additional shreds arrive after it has broadcast its attestation, it MUST NOT
+issue another RelayAttestation for that slot. The relay MUST include the
+proposer_signature received in each entry so that other nodes can verify the
+commitment without contacting the proposer.
 
 3.4 Consensus Leader Stage
 
 The leader collects RelayAttestation messages until its aggregation deadline.
 For each relay message, the leader verifies the relay_signature and then checks
 each proposer_signature inside it. The leader MUST discard a relay message if
-its relay_signature is invalid. The leader MUST ignore any entry with an invalid
-proposer signature and MAY keep the remaining entries from that relay
-attestation. The leader
+its relay_signature is invalid. The leader MUST discard a relay message if any
+proposer_signature inside it is invalid. The leader
 builds an AggregateAttestation containing all valid relay entries, sorted by
-relay_index. The leader MUST compute the block commitment used as block_id
-according to the underlying ledger rules, and MUST include that commitment in
-consensus_meta or another consensus-defined field that all validators can
-verify. The leader then constructs a ConsensusBlock with the aggregate,
+relay_index. Relay entries MUST be included byte-for-byte from the received
+RelayAttestation messages; the leader MUST NOT modify or filter the per-proposer
+lists. The leader then constructs a ConsensusBlock with the aggregate,
 consensus_meta, and delayed_bankhash, signs it, and submits it to the consensus
 protocol. If the number of relay entries in the aggregate is less
 than ATTESTATION_THRESHOLD * NUM_RELAYS, the leader SHOULD submit an empty
@@ -188,36 +202,47 @@ When a validator receives a ConsensusBlock for slot s, it MUST verify the
 leader_signature, check that the leader_index matches Leader[s], and verify
 delayed_bankhash against the local bank hash for the delayed slot defined by the
 consensus protocol. If any check fails, the validator MUST NOT vote for the
-block. The validator MUST verify each relay_signature and proposer_signature in
-the AggregateAttestation and MUST ignore any relay entry that fails
-verification. The validator computes the implied blocks by examining the
-AggregateAttestation. For each proposer_index in Proposers[s], the validator
-collects all commitments attested by relays in the aggregate. If the set of
-commitments contains more than one distinct value, the proposer is treated as
-equivocating and MUST be excluded. If there is exactly one commitment and the
-number of distinct relay attestations for it is at least
-INCLUSION_THRESHOLD * NUM_RELAYS, the proposer is included with that
-commitment. For each included proposer, the validator counts the number of
-locally stored shreds that pass witness verification for that commitment. If
-any included proposer has fewer than RECONSTRUCTION_THRESHOLD * NUM_RELAYS valid
-shreds, the validator MUST NOT vote for the block. If all included proposers
-meet the threshold, the validator submits a consensus vote with block_hash equal
-to block_id.
+block. The validator MUST verify each relay_signature in the
+AggregateAttestation. If a relay_signature is invalid, the validator MUST
+discard that relay entry. The validator MUST verify each proposer_signature
+inside the remaining relay entries, and if any proposer_signature inside a
+relay entry is invalid, the validator MUST discard that relay entry. The
+validator computes the implied blocks by examining the AggregateAttestation.
+For each proposer_index in Proposers[s], the validator collects all commitments
+attested by relays in the aggregate. If the set of commitments contains more
+than one distinct value, the proposer is treated as equivocating and MUST be
+excluded. If there is exactly one commitment and the number of distinct relay
+attestations for it is at least INCLUSION_THRESHOLD * NUM_RELAYS as rounded in
+Section 4, the proposer is included with that commitment. For each included
+proposer, the validator counts the number of locally stored shreds with
+distinct shred_index values that pass witness verification for that commitment.
+If any included proposer has fewer than RECONSTRUCTION_THRESHOLD * NUM_RELAYS
+valid shreds as rounded in Section 4, the validator MUST NOT vote for the
+block. If all included proposers meet the threshold, the validator submits a
+consensus vote with block_hash equal to block_id.
 
 3.6 Reconstruct and Replay Stage
 
 When consensus outputs a block for slot s, validators reconstruct proposer
 batches for all included proposers. For each proposer, reconstruction begins
 when at least RECONSTRUCTION_THRESHOLD * NUM_RELAYS valid shreds are available.
-The validator decodes the batch using the erasure code, re-encodes it, and
-recomputes the commitment. If the recomputed commitment does not match the
-included commitment, the proposer batch MUST be discarded. After reconstruction,
-validators concatenate the transactions from the surviving proposer batches and
-order them by ordering_fee. If two transactions have the same ordering_fee,
-their relative order MUST follow their order in the concatenated proposer
-batches ordered by proposer_index. The resulting ordered transaction list is
-the execution output for the slot. If consensus outputs an empty result for
-slot s, validators MUST output an empty execution result for the slot.
+The validator MAY decode from any set of distinct shreds that pass witness
+verification for the commitment; any such set yields the same decoded bytes for
+a valid commitment. If decoding fails, the proposer batch is treated as
+unavailable. The validator decodes the batch using the erasure code, re-encodes
+it, and recomputes the commitment. If the recomputed commitment does not match
+the included commitment, the proposer batch MUST be discarded. A proposer batch
+that contains duplicate transactions, where duplicates have identical serialized
+Transaction bytes, MUST be discarded. After reconstruction, validators
+concatenate the transactions from the surviving proposer batches ordered by
+proposer_index and then order them by ordering_fee, treating missing
+ordering_fee as zero. If two transactions have the same ordering_fee, their
+relative order MUST follow their order in the concatenated proposer batches.
+The protocol does not define cross-proposer deduplication; replay follows the
+underlying transaction processing semantics for already-processed transactions.
+The resulting ordered transaction list is the execution output for the slot. If
+consensus outputs an empty result for slot s, validators MUST output an empty
+execution result for the slot.
 
 4. System Parameters
 
@@ -225,52 +250,80 @@ The protocol uses system parameters that MUST be identical for all nodes and
 MUST be set by genesis or a network-wide feature gate. These parameters include
 NUM_PROPOSERS, NUM_RELAYS, ATTESTATION_THRESHOLD, INCLUSION_THRESHOLD,
 RECONSTRUCTION_THRESHOLD, DATA_SHREDS_PER_FEC_BLOCK, CODING_SHREDS_PER_FEC_BLOCK,
-and SHRED_DATA_BYTES. The recommended values for this version are
-NUM_PROPOSERS=16, NUM_RELAYS=200, ATTESTATION_THRESHOLD=0.6,
-INCLUSION_THRESHOLD=0.4, RECONSTRUCTION_THRESHOLD=0.2,
-DATA_SHREDS_PER_FEC_BLOCK=40, and CODING_SHREDS_PER_FEC_BLOCK=160. The erasure
-coding parameters MUST satisfy DATA_SHREDS_PER_FEC_BLOCK plus
+MERKLE_PROOF_ENTRY_BYTES, WITNESS_LEN, SHRED_DATA_BYTES, and SHRED_MESSAGE_BYTES.
+The recommended values for this version are NUM_PROPOSERS=16, NUM_RELAYS=200,
+ATTESTATION_THRESHOLD=0.6, INCLUSION_THRESHOLD=0.4,
+RECONSTRUCTION_THRESHOLD=0.2, DATA_SHREDS_PER_FEC_BLOCK=40,
+CODING_SHREDS_PER_FEC_BLOCK=160, MERKLE_PROOF_ENTRY_BYTES=20, WITNESS_LEN=8,
+SHRED_DATA_BYTES=952, and SHRED_MESSAGE_BYTES=1225. The erasure coding
+parameters MUST satisfy DATA_SHREDS_PER_FEC_BLOCK plus
 CODING_SHREDS_PER_FEC_BLOCK equals NUM_RELAYS. The erasure coding rate is
 defined as RECONSTRUCTION_THRESHOLD=DATA_SHREDS_PER_FEC_BLOCK/NUM_RELAYS.
 INCLUSION_THRESHOLD SHOULD be greater than or equal to
 RECONSTRUCTION_THRESHOLD so that an included proposer is reconstructable with
-high probability. SHRED_DATA_BYTES MUST be chosen so that a full Shred message
-fits the chosen transport MTU or the transport MUST support fragmentation.
-When a threshold is applied to a relay count, the required count is the
-smallest integer greater than or equal to threshold multiplied by NUM_RELAYS.
+high probability. SHRED_MESSAGE_BYTES MUST be supported by the transport
+without protocol-level fragmentation. When a threshold is applied to a relay
+count, the required count is the smallest integer greater than or equal to
+threshold multiplied by NUM_RELAYS.
 
 5. Schedules and Indices
 
 For each epoch, every validator MUST derive deterministic, stake-weighted
 schedules for proposers, relays, and consensus leaders using the same stake set
-and the same leader schedule algorithm used by the consensus protocol. The
-proposer and relay schedules MUST use domain separation distinct from the leader
-schedule so that the roles are independently randomized. The schedules MUST
-produce an ordered list of validator identities for the epoch. For each slot s,
-Proposers[s] is the ordered list of NUM_PROPOSERS identities obtained by taking
-the next NUM_PROPOSERS entries from the proposer schedule starting at the slot's
-index within the epoch, with wrap-around. Relays[s] is defined the same way from
-the relay schedule. Leader[s] is the consensus leader for slot s. A proposer
-index is the position of a validator in Proposers[s]. Proposers[s] and
-Relays[s] MAY contain duplicate identities, and a validator MAY appear multiple
-times within a list or across lists. A relay index is the position of a
-validator in Relays[s]. A leader index is the position of the leader in the
-consensus leader schedule for the slot. These indices are slot-scoped and MUST
-be used in message formats.
+and the same leader schedule algorithm used by the consensus protocol. For the
+stake-weighted schedule, validators form a keyed stake list from the epoch stake
+set. When the consensus leader schedule is vote-keyed, keyed stakes are the vote
+account public keys with stake greater than zero; otherwise keyed stakes are the
+validator identity public keys with stake greater than zero. The keyed stakes
+list is sorted by stake in descending order and then by public key in descending
+order, and duplicate public keys are removed after sorting. The schedule is
+constructed by sampling from a WeightedIndex distribution over the sorted stake
+weights using a ChaChaRng seeded with 32 bytes. For the consensus leader
+schedule, the seed is the epoch encoded as a little-endian u64 placed in the
+first 8 bytes with the remaining bytes set to zero, matching Agave's leader
+schedule. For proposer and relay schedules, the same algorithm is used with
+domain-separated seeds computed as SHA-256("MCP-PROPOSER-SCHEDULE" ||
+epoch_le_bytes) and SHA-256("MCP-RELAY-SCHEDULE" || epoch_le_bytes),
+respectively, where epoch_le_bytes is the epoch encoded as a little-endian u64.
+Let repeat be the consensus leader schedule repeat parameter
+(NUM_CONSECUTIVE_LEADER_SLOTS in Agave). For each slot index i in
+[0, slots_in_epoch - 1], if i mod repeat equals 0, sample a new key from the
+distribution; otherwise reuse the previously sampled key. The resulting ordered
+list of keys for the epoch is the schedule.
+
+For each slot s, Proposers[s] is the ordered list of NUM_PROPOSERS identities
+obtained by taking the next NUM_PROPOSERS entries from the proposer schedule
+starting at the slot's index within the epoch, with wrap-around. Relays[s] is
+defined the same way from the relay schedule. Leader[s] is the consensus leader
+for slot s. A proposer index is the position of a validator in Proposers[s].
+Proposers[s] and Relays[s] MAY contain duplicate identities, and a validator MAY
+appear multiple times within a list or across lists. A relay index is the
+position of a validator in Relays[s]. A leader index is the position of the
+leader in the consensus leader schedule for the slot. A validator index is the
+position of the validator identity public key in the sorted, deduplicated keyed
+stake list used for schedule generation for the epoch. These indices are
+slot-scoped and MUST be used in message formats.
 
 6. Cryptographic Primitives
 
 Hash denotes the 32-byte output of SHA-256. Signature denotes a 64-byte
 Ed25519 signature. Public keys are 32-byte Ed25519 public keys. A Merkle
 commitment is computed over the ordered list of NUM_RELAYS shreds. The leaf
-hash for shred i is SHA-256(0x00 || slot || proposer_index || i || shred_data),
-where slot is encoded as a u64, proposer_index as a u32, i as a u32, and
-shred_data is SHRED_DATA_BYTES bytes. Internal node hashes are computed as
-SHA-256(0x01 || left || right). When a level has an odd number of nodes, the
-last node is paired with itself. The commitment is the root hash of the tree.
-The witness is the ordered list of sibling hashes from leaf to root. The
-expected witness length is ceil(log2(NUM_RELAYS)). A witness verifies if it
-recomputes the commitment for the given index and leaf.
+hash for shred i is SHA-256(MERKLE_HASH_PREFIX_LEAF || slot || proposer_index ||
+i || shred_data), where slot is encoded as a u64, proposer_index as a u32, i as
+a u32, and shred_data is SHRED_DATA_BYTES bytes. MERKLE_HASH_PREFIX_LEAF is the
+byte string 0x00 || "SOLANA_MERKLE_SHREDS_LEAF" and MERKLE_HASH_PREFIX_NODE is
+0x01 || "SOLANA_MERKLE_SHREDS_NODE". A Merkle proof entry is the first
+MERKLE_PROOF_ENTRY_BYTES bytes of a SHA-256 hash. Internal node hashes are
+computed as SHA-256(MERKLE_HASH_PREFIX_NODE || left_entry || right_entry) where
+left_entry and right_entry are the truncated proof entries of the child hashes.
+When a level has an odd number of nodes, the last node is paired with itself.
+The commitment is the full 32-byte root hash of the tree. The witness is the
+ordered list of sibling proof entries from leaf to root. The witness length is
+WITNESS_LEN, which equals log2(NUM_RELAYS) when NUM_RELAYS is a power of two and
+otherwise equals floor(log2(NUM_RELAYS)) + 1. A witness verifies if it
+recomputes the commitment for the given index and leaf using the truncated
+entries at each step.
 
 7. Message Formats
 
@@ -293,14 +346,16 @@ TransactionConfigMask is a u32 bitmask that controls which config values are
 present. Bit 0 controls inclusion_fee, bit 1 controls ordering_fee, bit 2
 controls compute_unit_limit, bit 3 controls accounts_data_size_limit, bit 4
 controls heap_size, and bit 5 controls target_proposer. When a bit is set, the
-corresponding 4-byte value MUST appear in ascending bit order. Each
-InstructionHeader is a tuple (ProgramAccountIndex, NumInstructionAccounts,
-NumInstructionDataBytes). Each InstructionPayload is the concatenation of
-InstructionAccountIndexes, a u8 array of length NumInstructionAccounts, and
-InstructionData, a u8 array of length NumInstructionDataBytes. This protocol
-does not change the signature semantics or instruction semantics beyond the
-additional config fields. The fee and targeting fields are interpreted by local
-policy except where constrained by Section 8.
+corresponding 4-byte value MUST appear in ascending bit order, and each value is
+encoded as a little-endian u32. Each InstructionHeader is a tuple
+(ProgramAccountIndex, NumInstructionAccounts, NumInstructionDataBytes). Each
+InstructionPayload is the concatenation of InstructionAccountIndexes, a u8
+array of length NumInstructionAccounts, and InstructionData, a u8 array of
+length NumInstructionDataBytes. This protocol does not change the signature
+semantics or instruction semantics beyond the additional config fields. Mempool
+admission and proposer selection policy are local; replay interpretation of the
+fee and targeting fields is constrained only by Section 8 and otherwise MUST
+NOT affect transaction validity.
 
 
 Transaction Wire Format (variable length)
@@ -329,15 +384,16 @@ Transaction Wire Format (variable length)
 A Shred message carries a single erasure-coded shred from a proposer. It is
 serialized as slot (u64), proposer_index (u32), shred_index (u32), commitment
 (32 bytes), shred_data (SHRED_DATA_BYTES bytes), witness_len (u8), witness
-(witness_len consecutive 32-byte hashes), and proposer_signature (64 bytes).
+(witness_len consecutive MERKLE_PROOF_ENTRY_BYTES entries), and
+proposer_signature (64 bytes).
 The proposer_signature is computed by the proposer over the 32-byte commitment.
 The shred_index MUST equal the relay index for the intended relay. The
-witness_len value MUST match the Merkle proof length implied by NUM_RELAYS and
-the Merkle construction in Section 6. The witness MUST be a valid Merkle proof
-for shred_index under the commitment.
+witness_len value MUST equal WITNESS_LEN as defined in Section 4. The witness
+MUST be a valid Merkle proof for shred_index under the commitment. The
+serialized Shred message MUST have length SHRED_MESSAGE_BYTES.
 
 
-Shred Wire Format (variable length)
+Shred Wire Format (fixed length)
 ```text
 +-----------------+------------------------------+
 | Field           | Size (bytes)                 |
@@ -348,7 +404,8 @@ Shred Wire Format (variable length)
 | commitment      | 32                           |
 | shred_data      | SHRED_DATA_BYTES             |
 | witness_len     | 1                            |
-| witness         | 32 * witness_len             |
+| witness         | MERKLE_PROOF_ENTRY_BYTES *   |
+|                 | witness_len                  |
 | proposer_sig    | 64                           |
 +-----------------+------------------------------+
 ```
@@ -358,9 +415,11 @@ Shred Wire Format (variable length)
 RelayAttestation v1 is serialized as version (u8), slot (u64), relay_index
 (u32), entries_len (u8), entries (entries_len repetitions of proposer_index
 u32, commitment 32 bytes, proposer_signature 64 bytes), and relay_signature
-(64 bytes). Entries MUST be sorted by proposer_index in ascending order and
-MUST NOT contain duplicates. The relay_signature is computed over the bytes of
-version, slot, relay_index, entries_len, and entries in that order.
+(64 bytes). entries_len MUST be less than or equal to NUM_PROPOSERS and MUST
+match the number of entries. Entries MUST be sorted by proposer_index in
+ascending order and MUST NOT contain duplicates. The relay_signature is computed
+over the bytes of version, slot, relay_index, entries_len, and entries in that
+order.
 
 
 RelayAttestation Wire Format (variable length)
@@ -385,9 +444,12 @@ serialized as relay_index (u32), entries_len (u8), entries (entries_len
 repetitions of proposer_index u32, commitment 32 bytes, proposer_signature
 64 bytes), and relay_signature (64 bytes). Relay entries MUST be sorted by
 relay_index in ascending order. The entries inside each relay entry MUST be
-sorted by proposer_index in ascending order. AggregateAttestation does not
-include a leader signature. The canonical bytes of AggregateAttestation are the
-exact serialization defined in this section.
+sorted by proposer_index in ascending order. Each relay_signature MUST verify
+against the RelayAttestation v1 preimage with version=1, the AggregateAttestation
+slot value, and the relay_index, entries_len, and entries bytes as encoded in
+the relay entry. AggregateAttestation does not include a leader signature. The
+canonical bytes of AggregateAttestation are the exact serialization defined in
+this section.
 
 
 AggregateAttestation Wire Format (variable length)
@@ -425,10 +487,11 @@ AggregateAttestation v1), consensus_meta_len (u32), consensus_meta
 (64 bytes). The leader_signature is computed over all preceding bytes in the
 ConsensusBlock. The consensus_meta field is an opaque payload defined by the
 consensus protocol and MUST be interpreted consistently by all validators. The
-block_id is defined as the block commitment produced by the underlying ledger
-rules and carried in consensus_meta or another consensus-defined field. It is
-the value used in consensus votes and is not computed by hashing
-aggregate_bytes.
+block_id is the bank hash for slot s computed by the underlying ledger rules
+after replay and freeze. In Agave this is Bank::hash(), computed from the parent
+bank hash, signature count, last_blockhash, accounts hash, and any hard-fork
+mixins. block_id is the value used in consensus votes and is not computed by
+hashing aggregate_bytes.
 
 ConsensusBlock Wire Format (variable length)
 ```text
@@ -451,9 +514,9 @@ ConsensusBlock Wire Format (variable length)
 
 A Vote message is serialized as slot (u64), validator_index (u32), block_hash
 (32 bytes), vote_type (u8), timestamp (i64), and signature (64 bytes). The
-block_hash field MUST equal block_id for the corresponding ConsensusBlock. The
-vote_type encoding is defined by the underlying consensus protocol and is not
-changed by MCP.
+block_hash field MUST equal block_id, which is the bank hash for the
+corresponding slot. The vote_type encoding is defined by the underlying
+consensus protocol and is not changed by MCP.
 
 
 Vote Wire Format
@@ -510,3 +573,11 @@ carry its witness.
 This revision further states that each relay emits at most one RelayAttestation
 per slot, and it relaxes the schedule rules to permit duplicate identities in
 proposer and relay lists when the underlying schedule produces them.
+
+This revision labels the non-MCP baseline diagram, defines validator identity
+and schedule generation in terms of Agave's stake-weighted leader schedule
+algorithm with domain-separated seeds, and fixes Shred v1 sizing by adopting
+20-byte Merkle proof entries with fixed witness length. It also makes relay
+attestation validation all-or-nothing, defines block_id as the Agave bank hash,
+and specifies duplicate transaction handling within a proposer batch and
+ordering_fee defaults during replay.
