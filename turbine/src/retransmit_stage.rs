@@ -52,6 +52,9 @@ use {
     tokio::sync::mpsc::Sender as AsyncSender,
 };
 
+/// MCP block broadcast type: (slot, serialized_block_bytes)
+pub type McpBlockBroadcast = (Slot, Vec<u8>);
+
 const MAX_DUPLICATE_COUNT: usize = 2;
 const DEDUPER_FALSE_POSITIVE_RATE: f64 = 0.001;
 const DEDUPER_NUM_BITS: u64 = 637_534_199; // 76MB
@@ -655,6 +658,7 @@ impl RetransmitStage {
         xdp_sender: Option<XdpSender>,
         votor_event_sender: Sender<VotorEvent>,
         migration_status: Arc<MigrationStatus>,
+        mcp_block_receiver: Receiver<McpBlockBroadcast>,
     ) -> Self {
         let cluster_nodes_cache = ClusterNodesCache::<RetransmitStage>::new(
             CLUSTER_NODES_CACHE_NUM_EPOCH_CAP,
@@ -679,6 +683,20 @@ impl RetransmitStage {
             .spawn(move || {
                 let mut shred_buf = Vec::with_capacity(RETRANSMIT_BATCH_SIZE);
                 loop {
+                    // Check for MCP blocks to broadcast (non-blocking)
+                    while let Ok((slot, block_bytes)) = mcp_block_receiver.try_recv() {
+                        info!(
+                            "MCP: Retransmit received block for slot {} ({} bytes)",
+                            slot,
+                            block_bytes.len()
+                        );
+                        // TODO: Broadcast MCP block to validators via turbine
+                        // For now, we just log receipt. Full implementation would:
+                        // 1. Serialize block into packets
+                        // 2. Use cluster_nodes to determine recipients
+                        // 3. Send via retransmit_sockets or quic_endpoint_sender
+                    }
+
                     let res = retransmit(
                         &thread_pool,
                         &bank_forks,

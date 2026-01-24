@@ -7,8 +7,13 @@ pub(crate) const SIZE_OF_MERKLE_ROOT: usize = std::mem::size_of::<Hash>();
 const_assert_eq!(SIZE_OF_MERKLE_ROOT, 32);
 const_assert_eq!(SIZE_OF_MERKLE_PROOF_ENTRY, 20);
 pub const SIZE_OF_MERKLE_PROOF_ENTRY: usize = std::mem::size_of::<MerkleProofEntry>();
-// Number of proof entries for the standard 64 shred batch.
+// Number of proof entries for the standard 64 shred batch (32 data + 32 coding).
 pub(crate) const PROOF_ENTRIES_FOR_32_32_BATCH: u8 = 6;
+
+// MCP-06: Number of proof entries for MCP 200 shred batch (40 data + 160 coding).
+// ceil(log2(200)) = 8
+#[allow(dead_code)] // Reserved for MCP batch creation
+pub(crate) const PROOF_ENTRIES_FOR_MCP_BATCH: u8 = 8;
 
 // Defense against second preimage attack:
 // https://en.wikipedia.org/wiki/Merkle_tree#Second_preimage_attack

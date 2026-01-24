@@ -102,11 +102,21 @@ pub(super) fn get_version(shred: &[u8]) -> Option<u16> {
     Some(u16::from_le_bytes(bytes))
 }
 
+/// MCP-05: Get the proposer_id from the shred header.
+/// For MCP shreds, this is at byte offset 79.
+/// Returns DEFAULT_PROPOSER_ID (0) for legacy shreds.
+#[inline]
+pub fn get_proposer_id(shred: &[u8]) -> Option<u8> {
+    // MCP shreds have proposer_id at offset 79 (after version)
+    shred.get(79).copied()
+}
+
 // The caller should verify first that the shred is data and not code!
+// MCP-05: Offset updated from 83 to 84 due to proposer_id field.
 #[inline]
 pub(super) fn get_parent_offset(shred: &[u8]) -> Option<u16> {
     debug_assert_eq!(get_shred_type(shred).unwrap(), ShredType::Data);
-    let bytes = <[u8; 2]>::try_from(shred.get(83..83 + 2)?).unwrap();
+    let bytes = <[u8; 2]>::try_from(shred.get(84..84 + 2)?).unwrap();
     Some(u16::from_le_bytes(bytes))
 }
 
@@ -115,17 +125,18 @@ pub(super) fn get_parent_offset(shred: &[u8]) -> Option<u16> {
 pub(crate) fn corrupt_and_set_parent_offset(shred: &mut [u8], parent_offset: u16) {
     let bytes = parent_offset.to_le_bytes();
     assert_eq!(get_shred_type(shred).unwrap(), ShredType::Data);
-    shred.get_mut(83..83 + 2).unwrap().copy_from_slice(&bytes);
+    shred.get_mut(84..84 + 2).unwrap().copy_from_slice(&bytes);
 }
 
 // Returns DataShredHeader.flags if the shred is data.
 // Returns Error::InvalidShredType for coding shreds.
+// MCP-05: Offset updated from 85 to 86 due to proposer_id field.
 #[inline]
 pub fn get_flags(shred: &[u8]) -> Result<ShredFlags, Error> {
     match get_shred_type(shred)? {
         ShredType::Code => Err(Error::InvalidShredType),
         ShredType::Data => {
-            let Some(flags) = shred.get(85).copied() else {
+            let Some(flags) = shred.get(86).copied() else {
                 return Err(Error::InvalidPayloadSize(shred.len()));
             };
             ShredFlags::from_bits(flags).ok_or(Error::InvalidShredFlags(flags))
@@ -135,10 +146,11 @@ pub fn get_flags(shred: &[u8]) -> Result<ShredFlags, Error> {
 
 // Returns DataShredHeader.size for data shreds.
 // The caller should verify first that the shred is data and not code!
+// MCP-05: Offset updated from 86 to 87 due to proposer_id field.
 #[inline]
 fn get_data_size(shred: &[u8]) -> Result<u16, Error> {
     debug_assert_eq!(get_shred_type(shred).unwrap(), ShredType::Data);
-    let Some(bytes) = shred.get(86..86 + 2) else {
+    let Some(bytes) = shred.get(87..87 + 2) else {
         return Err(Error::InvalidPayloadSize(shred.len()));
     };
     let bytes = <[u8; 2]>::try_from(bytes).unwrap();
@@ -188,11 +200,12 @@ pub(crate) fn get_signed_data(shred: &[u8]) -> Option<Hash> {
     Some(data)
 }
 
+// MCP-05: Offset updated from 85 to 86 due to proposer_id field.
 pub fn get_reference_tick(shred: &[u8]) -> Result<u8, Error> {
     if get_shred_type(shred)? != ShredType::Data {
         return Err(Error::InvalidShredType);
     }
-    let Some(flags) = shred.get(85) else {
+    let Some(flags) = shred.get(86) else {
         return Err(Error::InvalidPayloadSize(shred.len()));
     };
     Ok(flags & ShredFlags::SHRED_TICK_REFERENCE_MASK.bits())

@@ -6,7 +6,10 @@ use {
     solana_entry::{block_component::BlockComponent, entry::Entry},
     solana_hash::Hash,
     solana_keypair::Keypair,
-    solana_ledger::shred::{ProcessShredsStats, ReedSolomonCache, Shredder},
+    solana_ledger::{
+        leader_schedule_cache::LeaderScheduleCache,
+        shred::{ProcessShredsStats, ReedSolomonCache, Shredder},
+    },
     solana_signature::Signature,
     solana_signer::Signer,
     solana_system_transaction as system_transaction,
@@ -58,6 +61,7 @@ impl BroadcastDuplicatesRun {
         shred_version: u16,
         config: BroadcastDuplicatesConfig,
         migration_status: Arc<MigrationStatus>,
+        _leader_schedule_cache: Arc<LeaderScheduleCache>,
     ) -> Self {
         let cluster_nodes_cache = Arc::new(ClusterNodesCache::<BroadcastStage>::new(
             CLUSTER_NODES_CACHE_NUM_EPOCH_CAP,

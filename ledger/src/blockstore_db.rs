@@ -201,6 +201,16 @@ impl Rocks {
             new_cf_descriptor::<columns::AlternateMerkleRootMeta>(options, oldest_slot),
             new_cf_descriptor::<columns::ParentMeta>(options, oldest_slot),
             new_cf_descriptor::<columns::DoubleMerkleMeta>(options, oldest_slot),
+            // MCP (Multiple Concurrent Proposers) columns
+            new_cf_descriptor::<columns::McpShredData>(options, oldest_slot),
+            new_cf_descriptor::<columns::McpShredCode>(options, oldest_slot),
+            new_cf_descriptor::<columns::McpSlotMeta>(options, oldest_slot),
+            new_cf_descriptor::<columns::McpErasureMeta>(options, oldest_slot),
+            new_cf_descriptor::<columns::McpMerkleRootMeta>(options, oldest_slot),
+            new_cf_descriptor::<columns::McpIndex>(options, oldest_slot),
+            new_cf_descriptor::<columns::McpConsensusPayload>(options, oldest_slot),
+            new_cf_descriptor::<columns::McpExecutionOutput>(options, oldest_slot),
+            new_cf_descriptor::<columns::McpRelayAttestation>(options, oldest_slot),
         ];
 
         // If the access type is Secondary, we don't need to open all of the

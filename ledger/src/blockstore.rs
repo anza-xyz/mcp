@@ -259,6 +259,18 @@ pub struct Blockstore {
     blocktime_cf: LedgerColumn<cf::Blocktime>,
     code_shred_cf: LedgerColumn<cf::ShredCode>,
     data_shred_cf: LedgerColumn<cf::ShredData>,
+    // MCP (Multiple Concurrent Proposers) shred columns
+    #[allow(dead_code)] // Will be used for MCP shred storage
+    mcp_code_shred_cf: LedgerColumn<cf::McpShredCode>,
+    #[allow(dead_code)] // Will be used for MCP shred storage
+    mcp_data_shred_cf: LedgerColumn<cf::McpShredData>,
+    // MCP consensus and execution columns
+    #[allow(dead_code)] // Will be used for MCP consensus storage
+    mcp_consensus_payload_cf: LedgerColumn<cf::McpConsensusPayload>,
+    #[allow(dead_code)] // Will be used for MCP execution output storage
+    mcp_execution_output_cf: LedgerColumn<cf::McpExecutionOutput>,
+    #[allow(dead_code)] // Will be used for MCP relay attestation storage
+    mcp_relay_attestation_cf: LedgerColumn<cf::McpRelayAttestation>,
     dead_slots_cf: LedgerColumn<cf::DeadSlots>,
     duplicate_slots_cf: LedgerColumn<cf::DuplicateSlots>,
     erasure_meta_cf: LedgerColumn<cf::ErasureMeta>,
@@ -442,6 +454,12 @@ impl Blockstore {
         let blocktime_cf = db.column();
         let code_shred_cf = db.column();
         let data_shred_cf = db.column();
+        // MCP (Multiple Concurrent Proposers) shred columns
+        let mcp_code_shred_cf = db.column();
+        let mcp_data_shred_cf = db.column();
+        let mcp_consensus_payload_cf = db.column();
+        let mcp_execution_output_cf = db.column();
+        let mcp_relay_attestation_cf = db.column();
         let dead_slots_cf = db.column();
         let duplicate_slots_cf = db.column();
         let erasure_meta_cf = db.column();
@@ -483,6 +501,11 @@ impl Blockstore {
             blocktime_cf,
             code_shred_cf,
             data_shred_cf,
+            mcp_code_shred_cf,
+            mcp_data_shred_cf,
+            mcp_consensus_payload_cf,
+            mcp_execution_output_cf,
+            mcp_relay_attestation_cf,
             dead_slots_cf,
             duplicate_slots_cf,
             erasure_meta_cf,
@@ -3143,6 +3166,195 @@ impl Blockstore {
             self.get_double_merkle_root(slot, *location)
                 .is_some_and(|dmr| dmr == block_id)
         })
+    }
+
+    // ========================================================================
+    // MCP (Multiple Concurrent Proposers) Shred Methods
+    // ========================================================================
+
+    /// Get an MCP data shred by slot, proposer_id, and shred_index.
+    #[allow(dead_code)]
+    pub fn get_mcp_data_shred(
+        &self,
+        slot: Slot,
+        proposer_id: u8,
+        shred_index: u64,
+    ) -> Result<Option<Vec<u8>>> {
+        self.mcp_data_shred_cf.get_bytes((slot, proposer_id, shred_index))
+    }
+
+    /// Get an MCP coding shred by slot, proposer_id, and shred_index.
+    #[allow(dead_code)]
+    pub fn get_mcp_coding_shred(
+        &self,
+        slot: Slot,
+        proposer_id: u8,
+        shred_index: u64,
+    ) -> Result<Option<Vec<u8>>> {
+        self.mcp_code_shred_cf.get_bytes((slot, proposer_id, shred_index))
+    }
+
+    /// Put an MCP data shred.
+    #[allow(dead_code)]
+    pub fn put_mcp_data_shred(&self, slot: Slot, proposer_id: u8, shred_index: u64, shred: &[u8]) -> Result<()> {
+        self.mcp_data_shred_cf.put_bytes((slot, proposer_id, shred_index), shred)
+    }
+
+    /// Put an MCP coding shred.
+    #[allow(dead_code)]
+    pub fn put_mcp_coding_shred(&self, slot: Slot, proposer_id: u8, shred_index: u64, shred: &[u8]) -> Result<()> {
+        self.mcp_code_shred_cf.put_bytes((slot, proposer_id, shred_index), shred)
+    }
+
+    /// Put an MCP data shred in a batch.
+    #[allow(dead_code)]
+    pub fn put_mcp_data_shred_in_batch(
+        &self,
+        write_batch: &mut WriteBatch,
+        slot: Slot,
+        proposer_id: u8,
+        shred_index: u64,
+        shred: &[u8],
+    ) -> Result<()> {
+        self.mcp_data_shred_cf.put_bytes_in_batch(write_batch, (slot, proposer_id, shred_index), shred)
+    }
+
+    /// Put an MCP coding shred in a batch.
+    #[allow(dead_code)]
+    pub fn put_mcp_coding_shred_in_batch(
+        &self,
+        write_batch: &mut WriteBatch,
+        slot: Slot,
+        proposer_id: u8,
+        shred_index: u64,
+        shred: &[u8],
+    ) -> Result<()> {
+        self.mcp_code_shred_cf.put_bytes_in_batch(write_batch, (slot, proposer_id, shred_index), shred)
+    }
+
+    /// Get all MCP data shreds for a (slot, proposer_id) pair.
+    #[allow(dead_code)]
+    pub fn get_mcp_data_shreds_for_proposer(
+        &self,
+        slot: Slot,
+        proposer_id: u8,
+    ) -> Result<Vec<(u64, Vec<u8>)>> {
+        // Iterate over all shred indices for this (slot, proposer_id)
+        let start_key = (slot, proposer_id, 0u64);
+        let iter = self.mcp_data_shred_cf.iter(IteratorMode::From(start_key, IteratorDirection::Forward))?;
+
+        let mut shreds = Vec::new();
+        for ((s, p, idx), data) in iter {
+            if s != slot || p != proposer_id {
+                break;
+            }
+            shreds.push((idx, data.to_vec()));
+        }
+        Ok(shreds)
+    }
+
+    /// Check if we have a specific MCP data shred.
+    #[allow(dead_code)]
+    pub fn has_mcp_data_shred(&self, slot: Slot, proposer_id: u8, shred_index: u64) -> bool {
+        self.mcp_data_shred_cf.get_bytes((slot, proposer_id, shred_index))
+            .map(|v| v.is_some())
+            .unwrap_or(false)
+    }
+
+    /// Count MCP data shreds for a proposer at a slot.
+    #[allow(dead_code)]
+    pub fn count_mcp_data_shreds_for_proposer(&self, slot: Slot, proposer_id: u8) -> Result<usize> {
+        Ok(self.get_mcp_data_shreds_for_proposer(slot, proposer_id)?.len())
+    }
+
+    /// Check if a slot has any MCP shreds (from any proposer).
+    pub fn has_mcp_shreds(&self, slot: Slot) -> bool {
+        // Check all proposers (0-15)
+        for proposer_id in 0..crate::mcp::NUM_PROPOSERS as u8 {
+            let start_key = (slot, proposer_id, 0u64);
+            if let Ok(mut iter) = self.mcp_data_shred_cf.iter(IteratorMode::From(start_key, IteratorDirection::Forward)) {
+                if let Some(((s, p, _), _)) = iter.next() {
+                    if s == slot && p == proposer_id {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    /// Get all MCP shreds for a slot across all proposers.
+    /// Returns a map of proposer_id -> list of (shred_index, shred_bytes).
+    pub fn get_all_mcp_shreds_for_slot(&self, slot: Slot) -> Result<std::collections::HashMap<u32, Vec<(u64, Vec<u8>)>>> {
+        let mut result = std::collections::HashMap::new();
+        for proposer_id in 0..crate::mcp::NUM_PROPOSERS as u32 {
+            let shreds = self.get_mcp_data_shreds_for_proposer(slot, proposer_id as u8)?;
+            if !shreds.is_empty() {
+                result.insert(proposer_id, shreds);
+            }
+        }
+        Ok(result)
+    }
+
+    /// Get MCP reconstruction status for a slot.
+    /// Returns true if enough shreds are available for reconstruction.
+    /// Per MCP spec §12.1, we need K_DATA_SHREDS (40) shreds per proposer.
+    pub fn can_reconstruct_mcp_slot(&self, slot: Slot) -> bool {
+        const K_DATA_SHREDS: usize = crate::mcp::fec::MCP_DATA_SHREDS_PER_FEC_BLOCK;
+
+        // Check if we have enough shreds for at least one proposer
+        for proposer_id in 0..crate::mcp::NUM_PROPOSERS as u32 {
+            if let Ok(shreds) = self.get_mcp_data_shreds_for_proposer(slot, proposer_id as u8) {
+                if shreds.len() >= K_DATA_SHREDS {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Store an MCP consensus payload (McpBlockV1 serialized).
+    /// Per MCP spec §11.1: The consensus leader writes the block after gathering attestations.
+    pub fn put_mcp_consensus_payload(&self, slot: Slot, block_hash: Hash, payload: &[u8]) -> Result<()> {
+        self.mcp_consensus_payload_cf.put_bytes((slot, block_hash), payload)
+    }
+
+    /// Get an MCP consensus payload by slot and block hash.
+    pub fn get_mcp_consensus_payload(&self, slot: Slot, block_hash: Hash) -> Result<Option<Vec<u8>>> {
+        self.mcp_consensus_payload_cf.get_bytes((slot, block_hash))
+    }
+
+    /// Store an MCP execution output (per spec §13: slot + output data).
+    pub fn put_mcp_execution_output(&self, slot: Slot, block_hash: Hash, output: &[u8]) -> Result<()> {
+        self.mcp_execution_output_cf.put_bytes((slot, block_hash), output)
+    }
+
+    /// Get an MCP execution output by slot and block hash.
+    pub fn get_mcp_execution_output(&self, slot: Slot, block_hash: Hash) -> Result<Option<Vec<u8>>> {
+        self.mcp_execution_output_cf.get_bytes((slot, block_hash))
+    }
+
+    /// Store an MCP relay attestation (per spec §12: slot + relay_index + attestation data).
+    pub fn put_mcp_relay_attestation(&self, slot: Slot, relay_index: u16, attestation: &[u8]) -> Result<()> {
+        self.mcp_relay_attestation_cf.put_bytes((slot, relay_index), attestation)
+    }
+
+    /// Get an MCP relay attestation by slot and relay index.
+    pub fn get_mcp_relay_attestation(&self, slot: Slot, relay_index: u16) -> Result<Option<Vec<u8>>> {
+        self.mcp_relay_attestation_cf.get_bytes((slot, relay_index))
+    }
+
+    /// Get all MCP relay attestations for a slot.
+    pub fn get_mcp_relay_attestations_for_slot(&self, slot: Slot) -> Result<Vec<(u16, Vec<u8>)>> {
+        let mut attestations = Vec::new();
+        let start_key = (slot, 0u16);
+        for ((s, relay_index), data) in self.mcp_relay_attestation_cf.iter(IteratorMode::From(start_key, IteratorDirection::Forward))? {
+            if s != slot {
+                break;
+            }
+            attestations.push((relay_index, data.to_vec()));
+        }
+        Ok(attestations)
     }
 
     // Only used by tests

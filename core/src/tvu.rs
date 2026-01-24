@@ -59,7 +59,7 @@ use {
         quic::{spawn_server, QuicServerParams, SpawnServerResult},
         streamer::StakedNodes,
     },
-    solana_turbine::{retransmit_stage::RetransmitStage, xdp::XdpSender},
+    solana_turbine::{retransmit_stage::{McpBlockBroadcast, RetransmitStage}, xdp::XdpSender},
     solana_votor::{
         consensus_rewards::{BuildRewardCertsRequest, BuildRewardCertsResponse},
         event::{LeaderWindowInfo, VotorEventReceiver, VotorEventSender},
@@ -308,6 +308,9 @@ impl Tvu {
             tvu_config.shred_sigverify_threads,
         );
 
+        // Create MCP block broadcast channel for consensus blocks
+        let (mcp_block_sender, mcp_block_receiver): (Sender<McpBlockBroadcast>, Receiver<McpBlockBroadcast>) = unbounded();
+
         let retransmit_stage = RetransmitStage::new(
             bank_forks.clone(),
             leader_schedule_cache.clone(),
@@ -321,6 +324,7 @@ impl Tvu {
             tvu_config.xdp_sender,
             votor_event_sender.clone(),
             migration_status.clone(),
+            mcp_block_receiver,
         );
 
         let (ancestor_duplicate_slots_sender, ancestor_duplicate_slots_receiver) = unbounded();
@@ -414,6 +418,7 @@ impl Tvu {
             votor_event_sender,
             own_vote_sender: consensus_message_sender,
             optimistic_parent_sender,
+            mcp_block_sender: Some(mcp_block_sender),
         };
 
         let replay_receivers = ReplayReceivers {
@@ -425,6 +430,7 @@ impl Tvu {
             popular_pruned_forks_receiver,
             consensus_message_receiver,
             votor_event_receiver,
+            mcp_attestation_receiver: None, // TODO: Wire attestation receiving socket
         };
 
         let replay_stage_config = ReplayStageConfig {

@@ -1,6 +1,7 @@
 use {
     crate::leader_schedule::{
-        IdentityKeyedLeaderSchedule, LeaderSchedule, VoteKeyedLeaderSchedule,
+        IdentityKeyedLeaderSchedule, LeaderSchedule, McpSchedule, ProposerId, RelayId,
+        VoteKeyedLeaderSchedule,
     },
     solana_clock::{Epoch, Slot, NUM_CONSECUTIVE_LEADER_SLOTS},
     solana_pubkey::Pubkey,
@@ -89,6 +90,55 @@ pub fn remaining_slots_in_window(slot: Slot) -> u64 {
     NUM_CONSECUTIVE_LEADER_SLOTS
         .checked_sub(leader_slot_index(slot) as u64)
         .unwrap()
+}
+
+// ============================================================================
+// MCP (Multiple Concurrent Proposers) Schedule Utilities
+// ============================================================================
+
+/// Return the MCP schedule for the given epoch.
+pub fn mcp_schedule(epoch: Epoch, bank: &Bank) -> Option<McpSchedule> {
+    bank.epoch_staked_nodes(epoch).map(|stakes| {
+        McpSchedule::new(
+            stakes.iter().map(|(pk, stake)| (pk, *stake)),
+            epoch,
+            bank.get_slots_in_epoch(epoch),
+        )
+    })
+}
+
+/// Get the proposers for the given slot.
+pub fn slot_proposers_at(slot: Slot, bank: &Bank) -> Option<Vec<Pubkey>> {
+    let (epoch, slot_index) = bank.get_epoch_and_slot_index(slot);
+    mcp_schedule(epoch, bank).map(|schedule| schedule.get_proposers_at_slot_index(slot_index))
+}
+
+/// Get the relays for the given slot.
+pub fn slot_relays_at(slot: Slot, bank: &Bank) -> Option<Vec<Pubkey>> {
+    let (epoch, slot_index) = bank.get_epoch_and_slot_index(slot);
+    mcp_schedule(epoch, bank).map(|schedule| schedule.get_relays_at_slot_index(slot_index))
+}
+
+/// Get the proposer ID for a pubkey at the given slot.
+pub fn proposer_id_at(slot: Slot, pubkey: &Pubkey, bank: &Bank) -> Option<ProposerId> {
+    let (epoch, slot_index) = bank.get_epoch_and_slot_index(slot);
+    mcp_schedule(epoch, bank).and_then(|schedule| schedule.get_proposer_id(slot_index, pubkey))
+}
+
+/// Get the relay ID for a pubkey at the given slot.
+pub fn relay_id_at(slot: Slot, pubkey: &Pubkey, bank: &Bank) -> Option<RelayId> {
+    let (epoch, slot_index) = bank.get_epoch_and_slot_index(slot);
+    mcp_schedule(epoch, bank).and_then(|schedule| schedule.get_relay_id(slot_index, pubkey))
+}
+
+/// Check if a pubkey is a proposer at the given slot.
+pub fn is_proposer_at(slot: Slot, pubkey: &Pubkey, bank: &Bank) -> bool {
+    proposer_id_at(slot, pubkey, bank).is_some()
+}
+
+/// Check if a pubkey is a relay at the given slot.
+pub fn is_relay_at(slot: Slot, pubkey: &Pubkey, bank: &Bank) -> bool {
+    relay_id_at(slot, pubkey, bank).is_some()
 }
 
 #[cfg(test)]

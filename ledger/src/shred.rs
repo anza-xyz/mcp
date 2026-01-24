@@ -86,6 +86,7 @@ use {solana_keypair::Keypair, solana_perf::packet::Packet, solana_signer::Signer
 mod common;
 pub(crate) mod merkle;
 pub mod merkle_tree;
+pub mod mcp_shred;
 mod payload;
 mod shred_code;
 mod shred_data;
@@ -105,9 +106,18 @@ pub const SIZE_OF_NONCE: usize = std::mem::size_of::<Nonce>();
 
 /// The following constants are computed by hand, and hardcoded.
 /// `test_shred_constants` ensures that the values are correct.
-const SIZE_OF_COMMON_SHRED_HEADER: usize = 83;
-pub const SIZE_OF_DATA_SHRED_HEADERS: usize = 88;
-const SIZE_OF_CODING_SHRED_HEADERS: usize = 89;
+///
+/// MCP-05: Added proposer_id (1 byte) after version field.
+/// Legacy shreds (without proposer_id) use SIZE_OF_*_LEGACY constants.
+const SIZE_OF_COMMON_SHRED_HEADER: usize = 84; // MCP: +1 for proposer_id
+#[allow(dead_code)] // Reserved for legacy shred compatibility
+const SIZE_OF_COMMON_SHRED_HEADER_LEGACY: usize = 83;
+pub const SIZE_OF_DATA_SHRED_HEADERS: usize = 89; // MCP: +1 for proposer_id
+#[allow(dead_code)] // Reserved for legacy shred compatibility
+const SIZE_OF_DATA_SHRED_HEADERS_LEGACY: usize = 88;
+const SIZE_OF_CODING_SHRED_HEADERS: usize = 90; // MCP: +1 for proposer_id
+#[allow(dead_code)] // Reserved for legacy shred compatibility
+const SIZE_OF_CODING_SHRED_HEADERS_LEGACY: usize = 89;
 const SIZE_OF_SIGNATURE: usize = SIGNATURE_BYTES;
 
 // Shreds are uniformly split into erasure batches with a "target" number of
@@ -117,6 +127,13 @@ const SIZE_OF_SIGNATURE: usize = SIGNATURE_BYTES;
 pub const DATA_SHREDS_PER_FEC_BLOCK: usize = 32;
 pub const CODING_SHREDS_PER_FEC_BLOCK: usize = 32;
 pub const SHREDS_PER_FEC_BLOCK: usize = DATA_SHREDS_PER_FEC_BLOCK + CODING_SHREDS_PER_FEC_BLOCK;
+
+// MCP-06: FEC parameters for MCP proposer shreds.
+// 40 data + 160 coding provides 4:1 redundancy, allowing recovery
+// with only 20% of total shreds (matching RECONSTRUCTION_THRESHOLD).
+pub const MCP_DATA_SHREDS_PER_FEC_BLOCK: usize = 40;
+pub const MCP_CODING_SHREDS_PER_FEC_BLOCK: usize = 160;
+pub const MCP_SHREDS_PER_FEC_BLOCK: usize = MCP_DATA_SHREDS_PER_FEC_BLOCK + MCP_CODING_SHREDS_PER_FEC_BLOCK;
 
 /// An upper bound on maximum number of data shreds we can handle in a slot
 /// 32K shreds would allow ~320K peak TPS
@@ -246,6 +263,13 @@ enum ShredVariant {
     }, // 0b10??_????
 }
 
+// Re-export consensus payload proposer ID from canonical source (mcp.rs)
+#[allow(unused_imports)]
+pub use crate::mcp::CONSENSUS_PAYLOAD_PROPOSER_ID;
+
+/// Default proposer ID for legacy/non-MCP shreds.
+pub const DEFAULT_PROPOSER_ID: u8 = 0;
+
 /// A common header that is present in data and code shred headers
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
 struct ShredCommonHeader {
@@ -254,6 +278,10 @@ struct ShredCommonHeader {
     slot: Slot,
     index: u32,
     version: u16,
+    /// MCP-05: Proposer ID identifying which proposer created this shred.
+    /// Valid values: 0-15 for regular proposers, 0xFF for consensus payload.
+    /// For legacy shreds, this defaults to 0.
+    proposer_id: u8,
     fec_set_index: u32,
 }
 
@@ -954,6 +982,7 @@ mod tests {
             slot: Slot::MAX,
             index: u32::MAX,
             version: u16::MAX,
+            proposer_id: u8::MAX, // MCP-05: proposer_id field
             fec_set_index: u32::MAX,
         };
         let data_shred_header = DataShredHeader {
@@ -1177,7 +1206,7 @@ mod tests {
             let parent_offset = 0u16;
             {
                 let mut cursor = Cursor::new(packet.buffer_mut());
-                cursor.seek(SeekFrom::Start(83)).unwrap();
+                cursor.seek(SeekFrom::Start(84)).unwrap(); // MCP-05: offset updated from 83 to 84
                 cursor.write_all(&parent_offset.to_le_bytes()).unwrap();
             }
             assert_eq!(
@@ -1198,7 +1227,7 @@ mod tests {
             let parent_offset = u16::try_from(slot + 1).unwrap();
             {
                 let mut cursor = Cursor::new(packet.buffer_mut());
-                cursor.seek(SeekFrom::Start(83)).unwrap();
+                cursor.seek(SeekFrom::Start(84)).unwrap(); // MCP-05: offset updated from 83 to 84
                 cursor.write_all(&parent_offset.to_le_bytes()).unwrap();
             }
             assert_eq!(

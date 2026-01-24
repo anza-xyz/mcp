@@ -37,8 +37,337 @@ use {
     solana_svm_transaction::svm_message::SVMMessage,
     solana_transaction_context::{transaction_accounts::TransactionAccount, IndexOfAccount},
     solana_transaction_error::{TransactionError, TransactionResult as Result},
-    std::num::{NonZeroU32, Saturating},
+    std::{collections::HashMap, num::{NonZeroU32, Saturating}},
 };
+
+// ============================================================================
+// MCP (Multiple Concurrent Proposers) Fee Payer Validation
+// ============================================================================
+
+/// Number of proposers in MCP.
+/// TODO: Move to a shared crate (solana-mcp-config) to avoid duplication with ledger/src/mcp.rs
+pub const MCP_NUM_PROPOSERS: u8 = 16;
+
+/// Errors that can occur during MCP fee payer validation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum McpFeePayerError {
+    /// Fee payer has insufficient funds for MCP multi-proposer scenario.
+    InsufficientFundsForMcp {
+        available: u64,
+        required: u64,
+    },
+    /// Fee payer has exceeded their per-slot commitment limit.
+    OverCommitted {
+        payer: Pubkey,
+        committed: u64,
+        max_allowed: u64,
+    },
+}
+
+impl std::fmt::Display for McpFeePayerError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InsufficientFundsForMcp { available, required } => {
+                write!(
+                    f,
+                    "insufficient funds for MCP: available {}, required {} (for {} proposers)",
+                    available, required, MCP_NUM_PROPOSERS
+                )
+            }
+            Self::OverCommitted {
+                payer,
+                committed,
+                max_allowed,
+            } => {
+                write!(
+                    f,
+                    "fee payer {} over-committed: {} committed, max allowed {}",
+                    payer, committed, max_allowed
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for McpFeePayerError {}
+
+/// Tracker for per-slot fee payer commitments in MCP.
+#[derive(Debug, Default)]
+pub struct SlotFeePayerTracker {
+    /// Maps fee payer pubkey to total committed fees in this slot.
+    commitments: HashMap<Pubkey, u64>,
+    /// The slot this tracker is for.
+    slot: u64,
+}
+
+impl SlotFeePayerTracker {
+    /// Create a new tracker for a slot.
+    pub fn new(slot: u64) -> Self {
+        Self {
+            commitments: HashMap::new(),
+            slot,
+        }
+    }
+
+    /// Get the slot this tracker is for.
+    pub fn slot(&self) -> u64 {
+        self.slot
+    }
+
+    /// Get the total committed fees for a payer.
+    pub fn get_commitment(&self, payer: &Pubkey) -> u64 {
+        self.commitments.get(payer).copied().unwrap_or(0)
+    }
+
+    /// Add a fee commitment for a payer.
+    pub fn add_commitment(&mut self, payer: Pubkey, fee: u64) -> u64 {
+        let entry = self.commitments.entry(payer).or_insert(0);
+        *entry = entry.saturating_add(fee);
+        *entry
+    }
+
+    /// Check if a payer can commit additional fees.
+    pub fn can_commit(
+        &self,
+        payer: &Pubkey,
+        fee: u64,
+        available_balance: u64,
+        min_balance: u64,
+    ) -> std::result::Result<(), McpFeePayerError> {
+        let current_commitment = self.get_commitment(payer);
+        let mcp_adjusted_fee = fee.saturating_mul(MCP_NUM_PROPOSERS as u64);
+        let new_total = current_commitment.saturating_add(mcp_adjusted_fee);
+        let spendable = available_balance.saturating_sub(min_balance);
+
+        if new_total > spendable {
+            return Err(McpFeePayerError::OverCommitted {
+                payer: *payer,
+                committed: new_total,
+                max_allowed: spendable,
+            });
+        }
+
+        Ok(())
+    }
+
+    /// Reset for a new slot.
+    pub fn reset_for_slot(&mut self, slot: u64) {
+        self.commitments.clear();
+        self.slot = slot;
+    }
+}
+
+/// Validate that a fee payer has sufficient funds for MCP multi-proposer scenario.
+pub fn validate_mcp_fee_payer(
+    payer_account: &AccountSharedData,
+    fee: u64,
+    rent: &Rent,
+    is_nonce: bool,
+) -> std::result::Result<(), McpFeePayerError> {
+    let balance = payer_account.lamports();
+
+    let min_balance = if is_nonce {
+        rent.minimum_balance(NonceState::size())
+    } else {
+        0
+    };
+
+    let mcp_fee_requirement = fee.saturating_mul(MCP_NUM_PROPOSERS as u64);
+    let total_required = min_balance.saturating_add(mcp_fee_requirement);
+
+    if balance < total_required {
+        return Err(McpFeePayerError::InsufficientFundsForMcp {
+            available: balance,
+            required: total_required,
+        });
+    }
+
+    Ok(())
+}
+
+/// Calculate the MCP-adjusted fee requirement for a transaction.
+pub fn calculate_mcp_fee_requirement(fee: u64, is_nonce: bool, rent: &Rent) -> u64 {
+    let min_balance = if is_nonce {
+        rent.minimum_balance(NonceState::size())
+    } else {
+        0
+    };
+
+    let mcp_fee = fee.saturating_mul(MCP_NUM_PROPOSERS as u64);
+    min_balance.saturating_add(mcp_fee)
+}
+
+// ============================================================================
+// MCP Fee-Only Replay Types
+// ============================================================================
+
+/// MCP fee breakdown for a transaction.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct McpFeeBreakdown {
+    /// Standard signature fee.
+    pub signature_fee: u64,
+    /// Prioritization fee (for execution priority).
+    pub prioritization_fee: u64,
+    /// MCP inclusion fee (for data availability).
+    pub inclusion_fee: u64,
+    /// MCP ordering fee (for ordering within proposer batch).
+    pub ordering_fee: u64,
+}
+
+impl McpFeeBreakdown {
+    /// Create a new fee breakdown.
+    pub const fn new(
+        signature_fee: u64,
+        prioritization_fee: u64,
+        inclusion_fee: u64,
+        ordering_fee: u64,
+    ) -> Self {
+        Self {
+            signature_fee,
+            prioritization_fee,
+            inclusion_fee,
+            ordering_fee,
+        }
+    }
+
+    /// Total fees to be charged.
+    pub const fn total(&self) -> u64 {
+        self.signature_fee
+            .saturating_add(self.prioritization_fee)
+            .saturating_add(self.inclusion_fee)
+            .saturating_add(self.ordering_fee)
+    }
+
+    /// Fees that are charged regardless of execution outcome.
+    pub const fn unconditional_fees(&self) -> u64 {
+        self.inclusion_fee
+    }
+
+    /// Fees that are only charged on successful execution.
+    pub const fn conditional_fees(&self) -> u64 {
+        self.signature_fee
+            .saturating_add(self.prioritization_fee)
+            .saturating_add(self.ordering_fee)
+    }
+}
+
+/// Result of the fee-only phase.
+#[derive(Debug, Clone)]
+pub enum FeePhaseResult {
+    /// Fees were successfully deducted.
+    Success {
+        fee_payer: Pubkey,
+        fees: McpFeeBreakdown,
+        post_fee_balance: u64,
+    },
+    /// Fee deduction failed.
+    Failure {
+        fee_payer: Pubkey,
+        error: TransactionError,
+    },
+}
+
+impl FeePhaseResult {
+    /// Returns true if fees were successfully deducted.
+    pub fn is_success(&self) -> bool {
+        matches!(self, Self::Success { .. })
+    }
+
+    /// Get the fee payer pubkey.
+    pub fn fee_payer(&self) -> &Pubkey {
+        match self {
+            Self::Success { fee_payer, .. } => fee_payer,
+            Self::Failure { fee_payer, .. } => fee_payer,
+        }
+    }
+}
+
+/// Tracks fee payments within a slot.
+#[derive(Debug, Default)]
+pub struct SlotFeeTracker {
+    slot: u64,
+    total_fees_collected: u64,
+    payer_fees: HashMap<Pubkey, u64>,
+    proposer_fees: HashMap<u8, u64>,
+}
+
+impl SlotFeeTracker {
+    /// Create a new tracker for a slot.
+    pub fn new(slot: u64) -> Self {
+        Self {
+            slot,
+            total_fees_collected: 0,
+            payer_fees: HashMap::new(),
+            proposer_fees: HashMap::new(),
+        }
+    }
+
+    /// Get the slot being tracked.
+    pub fn slot(&self) -> u64 {
+        self.slot
+    }
+
+    /// Record a fee payment.
+    pub fn record_fee_payment(
+        &mut self,
+        fee_payer: Pubkey,
+        proposer_id: u8,
+        fees: &McpFeeBreakdown,
+    ) {
+        let total = fees.total();
+        self.total_fees_collected = self.total_fees_collected.saturating_add(total);
+
+        *self.payer_fees.entry(fee_payer).or_insert(0) += total;
+        *self.proposer_fees.entry(proposer_id).or_insert(0) += fees.inclusion_fee;
+    }
+
+    /// Get total fees collected.
+    pub fn total_fees(&self) -> u64 {
+        self.total_fees_collected
+    }
+
+    /// Get fees paid by a specific payer.
+    pub fn payer_fees(&self, payer: &Pubkey) -> u64 {
+        self.payer_fees.get(payer).copied().unwrap_or(0)
+    }
+
+    /// Get inclusion fees for a proposer.
+    pub fn proposer_inclusion_fees(&self, proposer_id: u8) -> u64 {
+        self.proposer_fees.get(&proposer_id).copied().unwrap_or(0)
+    }
+}
+
+/// Performs the fee-only phase of transaction processing.
+pub fn execute_fee_phase(
+    fee_payer: &Pubkey,
+    fee_payer_account: &mut AccountSharedData,
+    fees: McpFeeBreakdown,
+    min_balance: u64,
+) -> FeePhaseResult {
+    let balance = fee_payer_account.lamports();
+    let total_fees = fees.total();
+    let required = min_balance.saturating_add(total_fees);
+
+    if balance < required {
+        return FeePhaseResult::Failure {
+            fee_payer: *fee_payer,
+            error: TransactionError::InsufficientFundsForFee,
+        };
+    }
+
+    let new_balance = balance.saturating_sub(total_fees);
+    fee_payer_account.set_lamports(new_balance);
+
+    FeePhaseResult::Success {
+        fee_payer: *fee_payer,
+        fees,
+        post_fee_balance: new_balance,
+    }
+}
+
+// ============================================================================
+// Standard Fee Payer Validation
+// ============================================================================
 
 // Per SIMD-0186, all accounts are assigned a base size of 64 bytes to cover
 // the storage cost of metadata.

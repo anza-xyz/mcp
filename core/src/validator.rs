@@ -1809,6 +1809,7 @@ impl Validator {
             key_notifiers.clone(),
             cancel,
             migration_status,
+            leader_schedule_cache.clone(),
         );
 
         datapoint_info!(

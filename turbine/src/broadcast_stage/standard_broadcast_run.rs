@@ -5,20 +5,28 @@ use {
         broadcast_utils::{self, ReceiveResults},
         *,
     },
-    crate::cluster_nodes::ClusterNodesCache,
+    crate::cluster_nodes::{
+        get_mcp_proposer_id, get_mcp_relay_targets, ClusterNodesCache, McpRelayTarget,
+    },
     crossbeam_channel::Sender,
     solana_entry::block_component::BlockComponent,
     solana_hash::Hash,
     solana_keypair::Keypair,
     solana_ledger::{
         blockstore_meta::BlockLocation,
+        leader_schedule_cache::LeaderScheduleCache,
+        mcp::NUM_RELAYS,
+        mcp_merkle::{McpMerkleTree, LEAF_PAYLOAD_SIZE},
+        mcp_reed_solomon::{McpReedSolomon, N_TOTAL_SHARDS},
         shred::{
+            mcp_shred::{McpShredV1, MCP_SHRED_PAYLOAD_BYTES},
             ProcessShredsStats, ReedSolomonCache, Shred, ShredType, Shredder,
             MAX_CODE_SHREDS_PER_SLOT, MAX_DATA_SHREDS_PER_SLOT,
         },
     },
     solana_runtime::bank::Bank,
     solana_sha256_hasher::hashv,
+    solana_signer::Signer,
     solana_time_utils::AtomicInterval,
     solana_votor::event::VotorEventSender,
     solana_votor_messages::migration::MigrationStatus,
@@ -49,6 +57,12 @@ pub struct StandardBroadcastRun {
     cluster_nodes_cache: Arc<ClusterNodesCache<BroadcastStage>>,
     reed_solomon_cache: Arc<ReedSolomonCache>,
     migration_status: Arc<MigrationStatus>,
+    // MCP proposer distribution support
+    leader_schedule_cache: Arc<LeaderScheduleCache>,
+    // MCP accumulated transactions for RS encoding at slot end
+    mcp_pending_transactions: Vec<Vec<u8>>,
+    // Cached MCP proposer ID for this slot (None if not an MCP proposer)
+    mcp_proposer_id: Option<u8>,
 }
 
 #[derive(Debug)]
@@ -57,7 +71,11 @@ enum BroadcastError {
 }
 
 impl StandardBroadcastRun {
-    pub(super) fn new(shred_version: u16, migration_status: Arc<MigrationStatus>) -> Self {
+    pub(super) fn new(
+        shred_version: u16,
+        migration_status: Arc<MigrationStatus>,
+        leader_schedule_cache: Arc<LeaderScheduleCache>,
+    ) -> Self {
         let cluster_nodes_cache = Arc::new(ClusterNodesCache::<BroadcastStage>::new(
             CLUSTER_NODES_CACHE_NUM_EPOCH_CAP,
             CLUSTER_NODES_CACHE_TTL,
@@ -82,6 +100,9 @@ impl StandardBroadcastRun {
             cluster_nodes_cache,
             reed_solomon_cache: Arc::<ReedSolomonCache>::default(),
             migration_status,
+            leader_schedule_cache,
+            mcp_pending_transactions: Vec::new(),
+            mcp_proposer_id: None,
         }
     }
 
@@ -131,6 +152,9 @@ impl StandardBroadcastRun {
         self.completed = false;
         self.slot_broadcast_start = Instant::now();
         self.num_batches = 0;
+        // Clear MCP state for new slot
+        self.mcp_pending_transactions.clear();
+        self.mcp_proposer_id = None;
 
         process_stats.receive_elapsed = 0;
         process_stats.coalesce_elapsed = 0;
@@ -317,10 +341,29 @@ impl StandardBroadcastRun {
             // Reinitialize state for this slot.
             self.reinitialize_state(blockstore, &bank, process_stats);
 
+            // Check if this node is an MCP proposer for the new slot
+            self.mcp_proposer_id = self.get_mcp_proposer_id_for_slot(
+                bank.slot(),
+                &keypair.pubkey(),
+                Some(&bank),
+            );
+            if self.mcp_proposer_id.is_some() {
+                debug!(
+                    "MCP proposer {} starting slot {}",
+                    self.mcp_proposer_id.unwrap(),
+                    bank.slot()
+                );
+            }
+
             self.migration_status.is_alpenglow_enabled()
         } else {
             false
         };
+
+        // Accumulate transactions for MCP RS encoding if this is an MCP proposer slot
+        if self.mcp_proposer_id.is_some() {
+            self.accumulate_mcp_transactions(&receive_results.component);
+        }
 
         // 2) Convert entries to shreds and coding shreds
         let is_last_in_slot = last_tick_height == bank.max_tick_height();
@@ -507,6 +550,47 @@ impl StandardBroadcastRun {
 
         transmit_stats.num_shreds = shreds.len();
 
+        // MCP proposer broadcast: only at slot end with proper RS encoding
+        // We check if this is the final batch (num_expected_batches.is_some()) and
+        // broadcast all accumulated transactions as RS-encoded MCP shreds.
+        let is_slot_end = broadcast_shred_batch_info
+            .as_ref()
+            .map(|info| info.num_expected_batches.is_some())
+            .unwrap_or(false);
+
+        if is_slot_end {
+            if let Some(proposer_id) = self.mcp_proposer_id {
+                if let Some(first_shred) = shreds.first() {
+                    let slot = first_shred.slot();
+                    let bank = bank_forks.read().ok().and_then(|bf| {
+                        bf.get(slot).or_else(|| Some(bf.working_bank()))
+                    });
+
+                    let relay_targets = self.get_mcp_relay_targets_for_slot(
+                        slot,
+                        cluster_info,
+                        bank.as_ref().map(|b| b.as_ref()),
+                    );
+
+                    if !relay_targets.is_empty() {
+                        if let BroadcastSocket::Udp(udp_sock) = sock {
+                            let keypair = cluster_info.keypair();
+                            // Use proper RS-encoded MCP broadcast
+                            let _ = self.broadcast_mcp_encoded_shreds(
+                                udp_sock,
+                                slot,
+                                proposer_id,
+                                &relay_targets,
+                                &keypair,
+                                &mut transmit_stats,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        // Standard turbine broadcast (in addition to MCP distribution)
         broadcast_shreds(
             sock,
             &shreds,
@@ -534,6 +618,273 @@ impl StandardBroadcastRun {
     ) {
         let mut transmit_shreds_stats = self.transmit_shreds_stats.lock().unwrap();
         transmit_shreds_stats.update(new_transmit_shreds_stats, broadcast_shred_batch_info);
+    }
+
+    // ========================================================================
+    // MCP (Multiple Concurrent Proposers) Proposer Distribution
+    // ========================================================================
+
+    /// Check if this node is an MCP proposer for the given slot.
+    /// Returns the proposer ID if this node is a proposer, None otherwise.
+    fn get_mcp_proposer_id_for_slot(
+        &self,
+        slot: Slot,
+        my_pubkey: &Pubkey,
+        bank: Option<&Bank>,
+    ) -> Option<u8> {
+        get_mcp_proposer_id(my_pubkey, slot, &self.leader_schedule_cache, bank)
+    }
+
+    /// Get MCP relay targets for broadcasting shreds.
+    /// Returns empty vec if MCP schedule is not available.
+    fn get_mcp_relay_targets_for_slot(
+        &self,
+        slot: Slot,
+        cluster_info: &ClusterInfo,
+        bank: Option<&Bank>,
+    ) -> Vec<McpRelayTarget> {
+        let Some(bank) = bank else {
+            return Vec::new();
+        };
+        let cluster_nodes = self.cluster_nodes_cache.get(
+            slot,
+            bank,
+            bank,
+            cluster_info,
+        );
+        get_mcp_relay_targets(
+            slot,
+            &cluster_nodes,
+            &self.leader_schedule_cache,
+            Some(bank),
+            cluster_info.socket_addr_space(),
+        )
+    }
+
+    /// Accumulate transactions from entries for MCP RS encoding.
+    /// Called when this node is an MCP proposer for the current slot.
+    fn accumulate_mcp_transactions(&mut self, component: &BlockComponent) {
+        if let BlockComponent::EntryBatch(entries) = component {
+            for entry in entries {
+                for tx in &entry.transactions {
+                    // Serialize the transaction for MCP payload
+                    if let Ok(tx_bytes) = bincode::serialize(tx) {
+                        self.mcp_pending_transactions.push(tx_bytes);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Broadcast MCP shreds using proper RS encoding (per spec §4.4 and §6.1).
+    ///
+    /// This function:
+    /// 1. Creates McpPayload from accumulated transactions
+    /// 2. RS-encodes the payload into K data + N-K parity shards (200 total)
+    /// 3. Builds Merkle commitment over the RS shards
+    /// 4. Creates McpShredV1 with witness proofs
+    /// 5. Sends each shred to its designated relay
+    #[allow(clippy::too_many_arguments)]
+    fn broadcast_mcp_encoded_shreds(
+        &mut self,
+        sock: &UdpSocket,
+        slot: Slot,
+        proposer_id: u8,
+        relay_targets: &[McpRelayTarget],
+        keypair: &Keypair,
+        _transmit_stats: &mut TransmitShredsStats,
+    ) -> std::result::Result<bool, Error> {
+        if relay_targets.is_empty() {
+            debug!("MCP broadcast: no relay targets for slot {}", slot);
+            return Ok(false);
+        }
+
+        let tx_count = self.mcp_pending_transactions.len();
+        if tx_count == 0 {
+            debug!("MCP broadcast: no transactions for slot {}", slot);
+            return Ok(false);
+        }
+
+        // Step 1: Serialize transactions into payload per spec §5
+        // payload_len (4) + tx_count (4) + tx_len[] (4 each) + tx_data[]
+        let payload_bytes = {
+            let tx_lengths: Vec<usize> = self.mcp_pending_transactions.iter().map(|t| t.len()).collect();
+            let total_tx_data: usize = tx_lengths.iter().sum();
+            let header_size = 4 + 4 + (tx_lengths.len() * 4);
+            let payload_len = header_size + total_tx_data - 4;
+
+            let mut bytes = Vec::with_capacity(header_size + total_tx_data);
+            bytes.extend_from_slice(&(payload_len as u32).to_le_bytes());
+            bytes.extend_from_slice(&(tx_count as u32).to_le_bytes());
+            for len in &tx_lengths {
+                bytes.extend_from_slice(&(*len as u32).to_le_bytes());
+            }
+            for tx_bytes in self.mcp_pending_transactions.drain(..) {
+                bytes.extend_from_slice(&tx_bytes);
+            }
+            bytes
+        };
+
+        // Step 2: RS-encode the payload
+        let rs_codec = McpReedSolomon::default();
+        let shards = match rs_codec.encode(&payload_bytes) {
+            Ok(s) => s,
+            Err(e) => {
+                error!("MCP RS encoding failed: {}", e);
+                return Ok(false);
+            }
+        };
+
+        debug_assert_eq!(shards.len(), N_TOTAL_SHARDS);
+
+        // Step 3: Pad shards and build Merkle tree
+        let padded_shards: Vec<Vec<u8>> = shards
+            .iter()
+            .map(|s| {
+                let mut padded = vec![0u8; LEAF_PAYLOAD_SIZE];
+                padded[..s.len().min(LEAF_PAYLOAD_SIZE)].copy_from_slice(&s[..s.len().min(LEAF_PAYLOAD_SIZE)]);
+                padded
+            })
+            .collect();
+
+        let shard_refs: Vec<&[u8]> = padded_shards.iter().map(|s| s.as_slice()).collect();
+        let merkle_tree = McpMerkleTree::from_payloads(&shard_refs);
+        let commitment = merkle_tree.commitment();
+
+        // Step 4: Sign the commitment per spec §5.2
+        let mut sig_msg = Vec::with_capacity(17 + 32);
+        sig_msg.extend_from_slice(b"mcp:commitment:v1");
+        sig_msg.extend_from_slice(commitment.as_ref());
+        let proposer_signature = keypair.sign_message(&sig_msg);
+
+        // Step 5: Create and send McpShredV1 for each shard
+        let mut sent_count = 0usize;
+        for (i, shard) in shards.iter().enumerate() {
+            let shred_index = i as u32;
+            let relay_index = (shred_index as u16) % NUM_RELAYS;
+
+            // Get Merkle proof for this shard
+            let leaf_index = (i % 256) as u8;
+            let proof = merkle_tree.get_proof(leaf_index);
+
+            // Create McpShredV1
+            let mut shred_data = [0u8; MCP_SHRED_PAYLOAD_BYTES];
+            let copy_len = shard.len().min(MCP_SHRED_PAYLOAD_BYTES);
+            shred_data[..copy_len].copy_from_slice(&shard[..copy_len]);
+
+            let mcp_shred = McpShredV1::new(
+                slot,
+                proposer_id as u32,
+                shred_index,
+                commitment.to_bytes(),
+                shred_data,
+                proof.siblings,
+                proposer_signature,
+            );
+
+            let mcp_bytes = mcp_shred.to_bytes();
+
+            // Find the relay target for this shred
+            if let Some(relay) = relay_targets.iter().find(|r| r.relay_id == relay_index) {
+                if let Some(addr) = relay.tvu_addr {
+                    if let Err(e) = sock.send_to(&mcp_bytes, addr) {
+                        debug!(
+                            "MCP broadcast to relay {} at {} failed: {}",
+                            relay_index, addr, e
+                        );
+                    } else {
+                        sent_count += 1;
+                        trace!(
+                            "MCP broadcast shred {} to relay {} ({}) at {}",
+                            shred_index,
+                            relay_index,
+                            relay.pubkey,
+                            addr
+                        );
+                    }
+                }
+            }
+        }
+
+        info!(
+            "MCP proposer {} broadcast {} RS-encoded shreds ({} txs) to {} relays for slot {}",
+            proposer_id,
+            sent_count,
+            tx_count,
+            relay_targets.len(),
+            slot
+        );
+
+        Ok(true)
+    }
+
+    /// Legacy try_mcp_broadcast for backward compatibility during transition.
+    /// This wraps standard shreds without proper RS encoding.
+    /// DEPRECATED: Use broadcast_mcp_encoded_shreds() instead.
+    #[allow(clippy::too_many_arguments)]
+    #[allow(dead_code)]
+    fn try_mcp_broadcast_legacy(
+        &mut self,
+        sock: &UdpSocket,
+        slot: Slot,
+        proposer_id: u8,
+        shreds: &[Shred],
+        relay_targets: &[McpRelayTarget],
+        keypair: &Keypair,
+        _transmit_stats: &mut TransmitShredsStats,
+    ) -> std::result::Result<bool, Error> {
+        if relay_targets.is_empty() || shreds.is_empty() {
+            return Ok(false);
+        }
+
+        // Step 1: Extract payloads and pad to MCP_SHRED_PAYLOAD_BYTES (952 bytes)
+        let mut payloads: Vec<[u8; MCP_SHRED_PAYLOAD_BYTES]> = Vec::with_capacity(shreds.len());
+        for shred in shreds {
+            let raw_payload = shred.payload();
+            let mut padded = [0u8; MCP_SHRED_PAYLOAD_BYTES];
+            let copy_len = raw_payload.len().min(MCP_SHRED_PAYLOAD_BYTES);
+            padded[..copy_len].copy_from_slice(&raw_payload[..copy_len]);
+            payloads.push(padded);
+        }
+
+        // Step 2: Build Merkle tree from payloads
+        let payload_refs: Vec<&[u8]> = payloads.iter().map(|p| p.as_slice()).collect();
+        let merkle_tree = McpMerkleTree::from_payloads(&payload_refs);
+        let commitment = merkle_tree.commitment();
+
+        // Step 3: Sign the commitment
+        let mut sig_msg = Vec::with_capacity(17 + 32);
+        sig_msg.extend_from_slice(b"mcp:commitment:v1");
+        sig_msg.extend_from_slice(commitment.as_ref());
+        let proposer_signature = keypair.sign_message(&sig_msg);
+
+        // Step 4: Create McpShredV1 for each shred and send
+        for (i, (shred, payload)) in shreds.iter().zip(payloads.iter()).enumerate() {
+            let shred_index = shred.index();
+            let relay_index = (shred_index as u16) % NUM_RELAYS;
+            let leaf_index = (i % 256) as u8;
+            let proof = merkle_tree.get_proof(leaf_index);
+
+            let mcp_shred = McpShredV1::new(
+                slot,
+                proposer_id as u32,
+                shred_index,
+                commitment.to_bytes(),
+                *payload,
+                proof.siblings,
+                proposer_signature,
+            );
+
+            let mcp_bytes = mcp_shred.to_bytes();
+
+            if let Some(relay) = relay_targets.iter().find(|r| r.relay_id == relay_index) {
+                if let Some(addr) = relay.tvu_addr {
+                    let _ = sock.send_to(&mcp_bytes, addr);
+                }
+            }
+        }
+
+        Ok(true)
     }
 
     fn report_and_reset_stats(&mut self, was_interrupted: bool) {

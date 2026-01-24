@@ -20,6 +20,12 @@ use {
             VotedStakes, SWITCH_FORK_THRESHOLD,
         },
         cost_update_service::CostUpdate,
+        mcp_consensus_block::{McpBlockV1, MIN_RELAYS_IN_BLOCK, BANKHASH_DELAY_SLOTS},
+        mcp_relay_attestation::{AttestationAggregator, MIN_RELAYS_FOR_BLOCK},
+        mcp_fee_mechanics::TwoPhaseProcessor,
+        mcp_replay_reconstruction::{
+            reconstruct_slot, ShredData, SlotReconstructionState,
+        },
         repair::{
             ancestor_hashes_service::AncestorHashesReplayUpdateSender,
             cluster_slot_state_verifier::*,
@@ -56,6 +62,8 @@ use {
         entry_notifier_service::EntryNotifierSender,
         leader_schedule_cache::LeaderScheduleCache,
         leader_schedule_utils::first_of_consecutive_leader_slots,
+        mcp_attestation::RelayAttestation,
+        shred::mcp_shred::McpShredV1,
     },
     solana_measure::measure::Measure,
     solana_poh::{
@@ -306,6 +314,9 @@ pub struct ReplayStageConfig {
     pub build_reward_certs_receiver: Receiver<BuildRewardCertsRequest>,
 }
 
+/// MCP block for consensus broadcast
+pub type McpBlockBroadcast = (Slot, Vec<u8>);
+
 pub struct ReplaySenders {
     pub rpc_subscriptions: Option<Arc<RpcSubscriptions>>,
     pub slot_status_notifier: Option<SlotStatusNotifier>,
@@ -325,6 +336,8 @@ pub struct ReplaySenders {
     pub votor_event_sender: VotorEventSender,
     pub own_vote_sender: Sender<ConsensusMessage>,
     pub optimistic_parent_sender: Sender<LeaderWindowInfo>,
+    /// MCP block broadcast sender (for consensus leader to distribute McpBlockV1)
+    pub mcp_block_sender: Option<Sender<McpBlockBroadcast>>,
 }
 
 pub struct ReplayReceivers {
@@ -336,6 +349,8 @@ pub struct ReplayReceivers {
     pub popular_pruned_forks_receiver: Receiver<Vec<u64>>,
     pub consensus_message_receiver: Receiver<ConsensusMessage>,
     pub votor_event_receiver: VotorEventReceiver,
+    /// MCP relay attestation receiver (for consensus leader)
+    pub mcp_attestation_receiver: Option<Receiver<RelayAttestation>>,
 }
 
 /// Timing information for the ReplayStage main processing loop
@@ -649,6 +664,7 @@ impl ReplayStage {
             votor_event_sender,
             own_vote_sender,
             optimistic_parent_sender,
+            mcp_block_sender,
         } = senders;
 
         let ReplayReceivers {
@@ -660,6 +676,7 @@ impl ReplayStage {
             popular_pruned_forks_receiver,
             consensus_message_receiver,
             votor_event_receiver,
+            mcp_attestation_receiver,
         } = receivers;
 
         trace!("replay stage");
@@ -820,6 +837,11 @@ impl ReplayStage {
                 while poh_controller.has_pending_message() && !exit.load(Ordering::Relaxed) {}
             }
 
+            // MCP attestation aggregator (for consensus leader)
+            let mut mcp_attestation_aggregator = AttestationAggregator::new(32);
+            // Track slots we've already built MCP blocks for
+            let mut mcp_blocks_built: std::collections::HashSet<Slot> = std::collections::HashSet::new();
+
             loop {
                 // Stop getting entries if we get exit signal
                 if exit.load(Ordering::Relaxed) {
@@ -878,6 +900,7 @@ impl ReplayStage {
                     (!migration_status.is_alpenglow_enabled()).then_some(&mut tbft_structs),
                     migration_status.as_ref(),
                     &votor_event_sender,
+                    &leader_schedule_cache,
                 );
                 let did_complete_bank = !new_frozen_slots.is_empty();
                 if migration_status.is_alpenglow_enabled() {
@@ -916,6 +939,53 @@ impl ReplayStage {
                     }
                 }
                 replay_active_banks_time.stop();
+
+                // Process MCP attestations (for consensus leader)
+                if let Some(ref attestation_rx) = mcp_attestation_receiver {
+                    // Drain attestations from the receiver without blocking
+                    while let Ok(attestation) = attestation_rx.try_recv() {
+                        let slot = attestation.slot;
+                        let relay_index = attestation.relay_index;
+
+                        // Persist attestation to blockstore for recovery/audit
+                        let mut attestation_bytes = Vec::new();
+                        if attestation.serialize(&mut attestation_bytes).is_ok() {
+                            if let Err(e) = blockstore.put_mcp_relay_attestation(slot, relay_index as u16, &attestation_bytes) {
+                                warn!("MCP: Failed to store attestation for slot {} relay {}: {}", slot, relay_index, e);
+                            }
+                        }
+
+                        if mcp_attestation_aggregator.add_attestation(attestation) {
+                            trace!(
+                                "MCP: Added attestation from relay {} for slot {}",
+                                relay_index, slot
+                            );
+                        }
+
+                        // Check if we can build an MCP block for this slot
+                        if !mcp_blocks_built.contains(&slot)
+                            && mcp_attestation_aggregator.can_finalize_slot(slot)
+                        {
+                            // Check if we're the leader for this slot
+                            let working_bank = bank_forks.read().unwrap().working_bank();
+                            if let Some(leader) = leader_schedule_cache.slot_leader_at(slot, Some(&working_bank)) {
+                                if leader == my_pubkey {
+                                    // We're the leader - build the MCP block
+                                    Self::try_build_mcp_block(
+                                        slot,
+                                        &my_pubkey,
+                                        &mcp_attestation_aggregator,
+                                        &blockstore,
+                                        &bank_forks,
+                                        &identity_keypair,
+                                        &mcp_block_sender,
+                                    );
+                                    mcp_blocks_built.insert(slot);
+                                }
+                            }
+                        }
+                    }
+                }
 
                 // Check if we've completed the migration conditions
                 if migration_status.is_ready_to_enable() {
@@ -2648,7 +2718,136 @@ impl ReplayStage {
         log_messages_bytes_limit: Option<usize>,
         prioritization_fee_cache: &PrioritizationFeeCache,
         migration_status: &MigrationStatus,
+        leader_schedule_cache: &LeaderScheduleCache,
     ) -> result::Result<usize, BlockstoreProcessorError> {
+        let slot = bank.slot();
+
+        // Check if this slot has MCP shreds for reconstruction
+        if blockstore.has_mcp_shreds(slot) {
+            if blockstore.can_reconstruct_mcp_slot(slot) {
+                // MCP slot ready for reconstruction
+                info!(
+                    "Slot {} has MCP shreds ready for reconstruction",
+                    slot
+                );
+
+                // 1. Load MCP shreds from blockstore
+                if let Ok(mcp_shreds) = blockstore.get_all_mcp_shreds_for_slot(slot) {
+                    // 2. Build reconstruction state
+                    let mut state = SlotReconstructionState::new(slot);
+
+                    // Track implied proposers (proposer_id -> commitment)
+                    // First, try to get implied proposers from MCP consensus block if available
+                    // Get proposer pubkeys for signature verification
+                    let proposer_pubkeys = leader_schedule_cache
+                        .get_proposers_at_slot(slot, Some(&**bank))
+                        .unwrap_or_default();
+
+                    let implied_proposers: Vec<(u32, Hash)> = match blockstore.get_mcp_consensus_payload(slot, bank.parent_block_id().unwrap_or_default()) {
+                        Ok(Some(block_bytes)) => {
+                            // Parse MCP block and use compute_implied_blocks_with_verification()
+                            match McpBlockV1::deserialize(&mut block_bytes.as_slice()) {
+                                Ok(mcp_block) => {
+                                    if mcp_block.relay_entries.len() >= MIN_RELAYS_IN_BLOCK {
+                                        // Use the block's implied proposers algorithm with signature verification
+                                        // per spec §11.2 and §5.2
+                                        let implied = if !proposer_pubkeys.is_empty() {
+                                            mcp_block.compute_implied_blocks_with_verification(&proposer_pubkeys)
+                                        } else {
+                                            // Fallback without verification if pubkeys unavailable
+                                            warn!("MCP slot {} no proposer pubkeys available, skipping signature verification", slot);
+                                            mcp_block.compute_implied_blocks()
+                                        };
+                                        info!(
+                                            "MCP slot {} using consensus block with {} relays, {} implied proposers (verified={})",
+                                            slot, mcp_block.relay_entries.len(), implied.len(), !proposer_pubkeys.is_empty()
+                                        );
+                                        implied
+                                    } else {
+                                        warn!(
+                                            "MCP slot {} has block with only {} relays (need {}), falling back to shred commitments",
+                                            slot, mcp_block.relay_entries.len(), MIN_RELAYS_IN_BLOCK
+                                        );
+                                        Self::extract_implied_proposers_from_shreds(&mcp_shreds)
+                                    }
+                                }
+                                Err(e) => {
+                                    warn!("Failed to parse MCP consensus block for slot {}: {}", slot, e);
+                                    Self::extract_implied_proposers_from_shreds(&mcp_shreds)
+                                }
+                            }
+                        }
+                        _ => {
+                            // No consensus block available, use shred commitments directly
+                            // This is the fallback path before full MCP activation
+                            trace!("No MCP consensus block for slot {}, using shred commitments", slot);
+                            Self::extract_implied_proposers_from_shreds(&mcp_shreds)
+                        }
+                    };
+
+                    // 3. Add all shreds to reconstruction state
+                    for (proposer_id, proposer_shreds) in mcp_shreds {
+                        for (idx, (_shred_idx, shred_bytes)) in proposer_shreds.iter().enumerate() {
+                            if let Ok(mcp_shred) = McpShredV1::from_bytes(shred_bytes) {
+                                let shred_data = ShredData {
+                                    index: idx as u16,
+                                    is_data: idx < solana_ledger::mcp::fec::MCP_DATA_SHREDS_PER_FEC_BLOCK,
+                                    data: mcp_shred.shred_data.to_vec(),
+                                    merkle_proof: mcp_shred.witness.to_vec(),
+                                };
+                                state.add_shred(proposer_id, shred_data);
+                            }
+                        }
+                    }
+
+                    // 4. Set implied proposers and reconstruct
+                    state.set_implied_proposers(implied_proposers.clone());
+                    let reconstruction = reconstruct_slot(&state, &implied_proposers);
+
+                    // Log reconstruction status
+                    info!(
+                        "MCP reconstruction for slot {}: {} proposers, {} transactions",
+                        slot,
+                        reconstruction.successful_proposer_count(),
+                        reconstruction.transaction_count()
+                    );
+
+                    // 5. Initialize two-phase processor with deterministic ordering
+                    // Per MCP spec §13.2: The ordered_transactions list determines:
+                    // - The deterministic execution order (proposers in order 0..15)
+                    // - The including proposer for fee attribution (first occurrence)
+                    let mut mcp_processor = TwoPhaseProcessor::new(slot);
+                    mcp_processor.set_ordered_transactions(&reconstruction.ordered_transactions);
+
+                    info!(
+                        "MCP: Initialized two-phase processor for slot {} with {} transactions",
+                        slot,
+                        reconstruction.transaction_count()
+                    );
+
+                    // TODO: Integrate mcp_processor with blockstore_processor::confirm_slot
+                    // to execute transactions using two-phase fee mechanics:
+                    // - Phase A: Deduct fees using mcp_processor.process_phase_a()
+                    // - Phase B: Execute transactions that passed Phase A
+                    // For now, we've established the deterministic ordering.
+
+                    for (proposer_id, success, shred_count) in state.get_reconstruction_status() {
+                        debug!(
+                            "  Proposer {}: {} ({} shreds)",
+                            proposer_id,
+                            if success { "reconstructed" } else { "incomplete" },
+                            shred_count
+                        );
+                    }
+                }
+            } else {
+                trace!(
+                    "Slot {} has MCP shreds but not enough for reconstruction yet",
+                    slot
+                );
+            }
+        }
+
         let mut w_replay_stats = replay_stats.write().unwrap();
         let mut w_replay_progress = replay_progress.write().unwrap();
         let tx_count_before = w_replay_progress.num_txs;
@@ -2674,6 +2873,114 @@ impl ReplayStage {
         let tx_count_after = w_replay_progress.num_txs;
         let tx_count = tx_count_after - tx_count_before;
         Ok(tx_count)
+    }
+
+    /// Extract implied proposers from MCP shreds when no consensus block is available.
+    /// This is a fallback path before full MCP activation or for testing.
+    fn extract_implied_proposers_from_shreds(
+        mcp_shreds: &std::collections::HashMap<u32, Vec<(u64, Vec<u8>)>>,
+    ) -> Vec<(u32, Hash)> {
+        let mut implied_proposers = Vec::new();
+        for (proposer_id, proposer_shreds) in mcp_shreds {
+            // Parse the first shred to get the commitment (they should all have the same)
+            if let Some((_, first_shred_bytes)) = proposer_shreds.first() {
+                if let Ok(first_shred) = McpShredV1::from_bytes(first_shred_bytes) {
+                    let commitment = Hash::new_from_array(first_shred.commitment);
+                    implied_proposers.push((*proposer_id, commitment));
+                }
+            }
+        }
+        // Sort by proposer_id for deterministic ordering
+        implied_proposers.sort_by_key(|(id, _)| *id);
+        implied_proposers
+    }
+
+    /// Build and store an MCP block when we have enough attestations as the leader.
+    ///
+    /// Per MCP spec §11:
+    /// - Leader aggregates relay attestations
+    /// - When >= 120 relays have attested, build the MCP block
+    /// - Block includes all relay attestations and is signed by the leader
+    /// - Block is broadcast through turbine for consensus
+    fn try_build_mcp_block(
+        slot: Slot,
+        _my_pubkey: &Pubkey,
+        aggregator: &AttestationAggregator,
+        blockstore: &Blockstore,
+        bank_forks: &RwLock<BankForks>,
+        identity_keypair: &Keypair,
+        mcp_block_sender: &Option<Sender<McpBlockBroadcast>>,
+    ) {
+        use crate::mcp_consensus_block::RelayEntryV1;
+
+        // Get the slot attestations from the aggregator
+        let attestation_count = aggregator.attestation_count(slot);
+        if attestation_count < MIN_RELAYS_FOR_BLOCK {
+            return;
+        }
+
+        info!(
+            "MCP: Building block for slot {} with {} relay attestations",
+            slot, attestation_count
+        );
+
+        // Get the delayed bankhash (slot - BANKHASH_DELAY_SLOTS)
+        let delayed_slot = slot.saturating_sub(BANKHASH_DELAY_SLOTS);
+        let delayed_bankhash = bank_forks
+            .read()
+            .ok()
+            .and_then(|bf| bf.get(delayed_slot))
+            .map(|b| b.hash())
+            .unwrap_or_default();
+
+        // Build relay entries from aggregated attestations
+        let all_attestations = aggregator.get_all_attestations(slot);
+        let included_proposers = aggregator.get_included_proposers(slot);
+
+        // Convert RelayAttestation to RelayEntryV1 for block construction
+        let relay_entries: Vec<RelayEntryV1> = all_attestations
+            .iter()
+            .map(|attestation| RelayEntryV1 {
+                relay_index: attestation.relay_index,
+                entries: attestation.entries.clone(),
+                relay_signature: attestation.relay_signature.as_ref().try_into().unwrap_or([0u8; 64]),
+            })
+            .collect();
+
+        // Create the unsigned block
+        let mut mcp_block = McpBlockV1::new_unsigned(
+            slot,
+            0, // leader_index - would come from schedule
+            delayed_bankhash,
+            relay_entries,
+        );
+
+        // Sign the block
+        mcp_block.sign(identity_keypair);
+
+        // Serialize and store in blockstore
+        let mut block_bytes = Vec::new();
+        if mcp_block.serialize(&mut block_bytes).is_ok() {
+            let block_hash = mcp_block.compute_block_hash();
+            if let Err(e) = blockstore.put_mcp_consensus_payload(slot, block_hash, &block_bytes) {
+                error!("MCP: Failed to store block for slot {}: {:?}", slot, e);
+            } else {
+                info!(
+                    "MCP: Successfully stored block for slot {} with {} included proposers",
+                    slot,
+                    included_proposers.len()
+                );
+
+                // Broadcast the block through turbine for consensus
+                if let Some(sender) = mcp_block_sender {
+                    if let Err(e) = sender.send((slot, block_bytes)) {
+                        error!("MCP: Failed to broadcast block for slot {}: {:?}", slot, e);
+                    } else {
+                        info!("MCP: Broadcast block for slot {} to network", slot);
+                    }
+                }
+            }
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -3317,6 +3624,7 @@ impl ReplayStage {
         active_bank_slots: &[Slot],
         prioritization_fee_cache: &PrioritizationFeeCache,
         migration_status: &MigrationStatus,
+        leader_schedule_cache: &LeaderScheduleCache,
     ) -> Vec<ReplaySlotFromBlockstore> {
         // Make mutable shared structures thread safe.
         let progress = RwLock::new(progress);
@@ -3400,6 +3708,7 @@ impl ReplayStage {
                             log_messages_bytes_limit,
                             prioritization_fee_cache,
                             migration_status,
+                            leader_schedule_cache,
                         );
                         replay_blockstore_time.stop();
                         replay_result.replay_result = Some(blockstore_result);
@@ -3434,6 +3743,7 @@ impl ReplayStage {
         bank_slot: Slot,
         prioritization_fee_cache: &PrioritizationFeeCache,
         migration_status: &MigrationStatus,
+        leader_schedule_cache: &LeaderScheduleCache,
     ) -> ReplaySlotFromBlockstore {
         let mut replay_result = ReplaySlotFromBlockstore {
             is_slot_dead: false,
@@ -3491,6 +3801,7 @@ impl ReplayStage {
                     log_messages_bytes_limit,
                     prioritization_fee_cache,
                     migration_status,
+                    leader_schedule_cache,
                 );
                 replay_blockstore_time.stop();
                 replay_result.replay_result = Some(blockstore_result);
@@ -3939,6 +4250,7 @@ impl ReplayStage {
         tbft_structs: Option<&mut TowerBFTStructures>,
         migration_status: &MigrationStatus,
         votor_event_sender: &VotorEventSender,
+        leader_schedule_cache: &LeaderScheduleCache,
     ) -> Vec<Slot> /* completed slots */ {
         let active_bank_slots = bank_forks.read().unwrap().active_bank_slots();
         let num_active_banks = active_bank_slots.len();
@@ -3967,6 +4279,7 @@ impl ReplayStage {
                     &active_bank_slots,
                     prioritization_fee_cache,
                     migration_status,
+                    leader_schedule_cache,
                 )
             }
             ForkReplayMode::Serial | ForkReplayMode::Parallel(_) => active_bank_slots
@@ -3988,6 +4301,7 @@ impl ReplayStage {
                         *bank_slot,
                         prioritization_fee_cache,
                         migration_status,
+                        leader_schedule_cache,
                     )
                 })
                 .collect(),
@@ -5681,6 +5995,7 @@ pub(crate) mod tests {
                 .thread_name(|i| format!("solReplayTest{i:02}"))
                 .build()
                 .expect("new rayon threadpool");
+            let leader_schedule_cache = LeaderScheduleCache::new_from_bank(&bank1);
             let res = ReplayStage::replay_blockstore_into_bank(
                 &bank1,
                 &blockstore,
@@ -5694,6 +6009,7 @@ pub(crate) mod tests {
                 None,
                 &PrioritizationFeeCache::new(0u64),
                 &MigrationStatus::default(),
+                &leader_schedule_cache,
             );
             let max_complete_transaction_status_slot = Arc::new(AtomicU64::default());
             let rpc_subscriptions = Arc::new(RpcSubscriptions::new_for_tests(

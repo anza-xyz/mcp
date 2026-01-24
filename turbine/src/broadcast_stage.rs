@@ -23,12 +23,19 @@ use {
     },
     solana_hash::Hash,
     solana_keypair::Keypair,
-    solana_ledger::{blockstore::Blockstore, shred::Shred},
+    solana_ledger::{
+        blockstore::Blockstore,
+        leader_schedule_cache::LeaderScheduleCache,
+        mcp::NUM_RELAYS,
+        shred::Shred,
+    },
     solana_measure::measure::Measure,
     solana_metrics::{inc_new_counter_error, inc_new_counter_info},
     solana_poh::poh_recorder::WorkingBankEntryMarker,
     solana_pubkey::Pubkey,
     solana_runtime::{bank::MAX_LEADER_SCHEDULE_STAKES, bank_forks::BankForks},
+    solana_signature::Signature,
+    solana_signer::Signer,
     solana_streamer::{
         sendmmsg::{batch_send, SendPktsError},
         socket::SocketAddrSpace,
@@ -64,6 +71,199 @@ const CLUSTER_NODES_CACHE_TTL: Duration = Duration::from_secs(5);
 
 pub(crate) type RecordReceiver = Receiver<(Arc<Vec<Shred>>, Option<BroadcastShredBatchInfo>)>;
 pub(crate) type TransmitReceiver = Receiver<(Arc<Vec<Shred>>, Option<BroadcastShredBatchInfo>)>;
+
+// ============================================================================
+// MCP (Multiple Concurrent Proposers) Proposer Types
+// ============================================================================
+
+/// A shred ready for distribution to relays.
+#[derive(Debug, Clone)]
+pub struct ProposerShred {
+    pub slot: u64,
+    pub proposer_id: u8,
+    pub shred_index: u32,
+    pub data: Vec<u8>,
+}
+
+/// A complete shred batch from a proposer with merkle commitment.
+#[derive(Debug)]
+pub struct ProposerShredBatch {
+    pub slot: u64,
+    pub proposer_id: u8,
+    pub commitment: Hash,
+    pub shreds: Vec<ShredWithWitness>,
+}
+
+/// A shred paired with its merkle witness.
+#[derive(Debug, Clone)]
+pub struct ShredWithWitness {
+    pub index: u32,
+    pub data: Vec<u8>,
+    pub witness: Vec<u8>,
+}
+
+/// Wire message for distributing a shred to a relay.
+#[derive(Debug, Clone)]
+pub struct RelayShredMessage {
+    pub slot: u64,
+    pub proposer_id: u8,
+    pub shred_index: u32,
+    pub commitment: Hash,
+    pub shred_data: Vec<u8>,
+    pub witness: Vec<u8>,
+    pub proposer_signature: Signature,
+}
+
+impl RelayShredMessage {
+    /// Get the data that was signed by the proposer.
+    pub fn get_signing_data(slot: u64, proposer_id: u8, shred_index: u32, commitment: &Hash) -> Vec<u8> {
+        let mut data = Vec::with_capacity(8 + 1 + 4 + 32);
+        data.extend_from_slice(&slot.to_le_bytes());
+        data.push(proposer_id);
+        data.extend_from_slice(&shred_index.to_le_bytes());
+        data.extend_from_slice(commitment.as_ref());
+        data
+    }
+
+    /// Serialize the message for network transmission.
+    pub fn serialize(&self) -> Vec<u8> {
+        let mut buffer = Vec::new();
+        buffer.extend_from_slice(&self.slot.to_le_bytes());
+        buffer.push(self.proposer_id);
+        buffer.extend_from_slice(&self.shred_index.to_le_bytes());
+        buffer.extend_from_slice(self.commitment.as_ref());
+        buffer.extend_from_slice(&(self.shred_data.len() as u32).to_le_bytes());
+        buffer.extend_from_slice(&self.shred_data);
+        buffer.extend_from_slice(&(self.witness.len() as u16).to_le_bytes());
+        buffer.extend_from_slice(&self.witness);
+        buffer.extend_from_slice(self.proposer_signature.as_ref());
+        buffer
+    }
+
+    /// Deserialize a message from bytes.
+    pub fn deserialize(data: &[u8]) -> Option<Self> {
+        if data.len() < 8 + 1 + 4 + 32 + 4 + 2 + 64 {
+            return None;
+        }
+
+        let mut offset = 0;
+        let slot = u64::from_le_bytes(data[offset..offset + 8].try_into().ok()?);
+        offset += 8;
+        let proposer_id = data[offset];
+        offset += 1;
+        let shred_index = u32::from_le_bytes(data[offset..offset + 4].try_into().ok()?);
+        offset += 4;
+        let commitment = Hash::from(<[u8; 32]>::try_from(&data[offset..offset + 32]).ok()?);
+        offset += 32;
+        let shred_data_len = u32::from_le_bytes(data[offset..offset + 4].try_into().ok()?) as usize;
+        offset += 4;
+        if data.len() < offset + shred_data_len { return None; }
+        let shred_data = data[offset..offset + shred_data_len].to_vec();
+        offset += shred_data_len;
+        if data.len() < offset + 2 { return None; }
+        let witness_len = u16::from_le_bytes(data[offset..offset + 2].try_into().ok()?) as usize;
+        offset += 2;
+        if data.len() < offset + witness_len { return None; }
+        let witness = data[offset..offset + witness_len].to_vec();
+        offset += witness_len;
+        if data.len() < offset + 64 { return None; }
+        let sig_bytes: [u8; 64] = data[offset..offset + 64].try_into().ok()?;
+        let proposer_signature = Signature::from(sig_bytes);
+
+        Some(Self {
+            slot, proposer_id, shred_index, commitment, shred_data, witness, proposer_signature,
+        })
+    }
+
+    /// Verify the proposer's signature.
+    pub fn verify_signature(&self, proposer_pubkey: &Pubkey) -> bool {
+        let signing_data = Self::get_signing_data(self.slot, self.proposer_id, self.shred_index, &self.commitment);
+        self.proposer_signature.verify(proposer_pubkey.as_ref(), &signing_data)
+    }
+}
+
+/// Proposer shred distributor for MCP.
+pub struct ProposerDistributor {
+    proposer_id: u8,
+    keypair: Keypair,
+}
+
+impl ProposerDistributor {
+    /// Create a new proposer distributor.
+    pub fn new(proposer_id: u8, keypair: Keypair) -> Self {
+        Self { proposer_id, keypair }
+    }
+
+    /// Get this proposer's ID.
+    pub fn proposer_id(&self) -> u8 {
+        self.proposer_id
+    }
+
+    /// Get this proposer's pubkey.
+    pub fn pubkey(&self) -> Pubkey {
+        self.keypair.pubkey()
+    }
+
+    /// Create messages for distributing a shred batch to relays.
+    pub fn prepare_distribution(&self, batch: &ProposerShredBatch) -> Vec<(u16, RelayShredMessage)> {
+        batch.shreds.iter().map(|shred| {
+            let shred_index = shred.index;
+            let relay_index = (shred_index as u16) % NUM_RELAYS;
+            let signing_data = RelayShredMessage::get_signing_data(
+                batch.slot, batch.proposer_id, shred_index, &batch.commitment,
+            );
+            let signature = self.keypair.sign_message(&signing_data);
+            let message = RelayShredMessage {
+                slot: batch.slot,
+                proposer_id: batch.proposer_id,
+                shred_index,
+                commitment: batch.commitment,
+                shred_data: shred.data.clone(),
+                witness: shred.witness.clone(),
+                proposer_signature: signature,
+            };
+            (relay_index, message)
+        }).collect()
+    }
+
+    /// Create a signed relay shred message.
+    pub fn create_message(
+        &self, slot: u64, shred_index: u32, commitment: Hash, shred_data: Vec<u8>, witness: Vec<u8>,
+    ) -> RelayShredMessage {
+        let signing_data = RelayShredMessage::get_signing_data(slot, self.proposer_id, shred_index, &commitment);
+        let signature = self.keypair.sign_message(&signing_data);
+        RelayShredMessage {
+            slot, proposer_id: self.proposer_id, shred_index, commitment, shred_data, witness, proposer_signature: signature,
+        }
+    }
+}
+
+/// Target information for a relay.
+#[derive(Debug, Clone)]
+pub struct RelayTarget {
+    pub relay_index: u16,
+    pub pubkey: Pubkey,
+    pub addr: SocketAddr,
+}
+
+/// Distribution plan for sending shreds to relays.
+#[derive(Debug, Default)]
+pub struct DistributionPlan {
+    pub messages: Vec<(RelayTarget, RelayShredMessage)>,
+}
+
+impl DistributionPlan {
+    pub fn new() -> Self { Self { messages: Vec::new() } }
+    pub fn add(&mut self, target: RelayTarget, message: RelayShredMessage) {
+        self.messages.push((target, message));
+    }
+    pub fn len(&self) -> usize { self.messages.len() }
+    pub fn is_empty(&self) -> bool { self.messages.is_empty() }
+}
+
+// ============================================================================
+// Broadcast Stage Errors
+// ============================================================================
 
 #[derive(Debug, Error)]
 pub enum Error {
@@ -128,6 +328,7 @@ impl BroadcastStageType {
         xdp_sender: Option<XdpSender>,
         votor_event_sender: VotorEventSender,
         migration_status: Arc<MigrationStatus>,
+        leader_schedule_cache: Arc<LeaderScheduleCache>,
     ) -> BroadcastStage {
         match self {
             BroadcastStageType::Standard => BroadcastStage::new(
@@ -140,7 +341,7 @@ impl BroadcastStageType {
                 bank_forks,
                 quic_endpoint_sender,
                 votor_event_sender.clone(),
-                StandardBroadcastRun::new(shred_version, migration_status),
+                StandardBroadcastRun::new(shred_version, migration_status, leader_schedule_cache),
                 xdp_sender,
             ),
 
@@ -154,7 +355,7 @@ impl BroadcastStageType {
                 bank_forks,
                 quic_endpoint_sender,
                 votor_event_sender.clone(),
-                FailEntryVerificationBroadcastRun::new(shred_version, migration_status),
+                FailEntryVerificationBroadcastRun::new(shred_version, migration_status, leader_schedule_cache),
                 xdp_sender,
             ),
 
@@ -168,7 +369,7 @@ impl BroadcastStageType {
                 bank_forks,
                 quic_endpoint_sender,
                 votor_event_sender.clone(),
-                BroadcastFakeShredsRun::new(0, shred_version, migration_status),
+                BroadcastFakeShredsRun::new(0, shred_version, migration_status, leader_schedule_cache),
                 xdp_sender,
             ),
 
@@ -182,7 +383,7 @@ impl BroadcastStageType {
                 bank_forks,
                 quic_endpoint_sender,
                 votor_event_sender.clone(),
-                BroadcastDuplicatesRun::new(shred_version, config.clone(), migration_status),
+                BroadcastDuplicatesRun::new(shred_version, config.clone(), migration_status, leader_schedule_cache),
                 xdp_sender,
             ),
         }

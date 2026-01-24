@@ -14,8 +14,8 @@ use {
             },
             CodingShredHeader, DataShredHeader, Error, ProcessShredsStats, ShredCommonHeader,
             ShredFlags, ShredVariant, CODING_SHREDS_PER_FEC_BLOCK, DATA_SHREDS_PER_FEC_BLOCK,
-            SHREDS_PER_FEC_BLOCK, SIZE_OF_CODING_SHRED_HEADERS, SIZE_OF_DATA_SHRED_HEADERS,
-            SIZE_OF_SIGNATURE,
+            DEFAULT_PROPOSER_ID, SHREDS_PER_FEC_BLOCK, SIZE_OF_CODING_SHRED_HEADERS,
+            SIZE_OF_DATA_SHRED_HEADERS, SIZE_OF_SIGNATURE,
         },
         shredder::ReedSolomonCache,
     },
@@ -40,7 +40,8 @@ use {
     },
 };
 
-const_assert_eq!(ShredData::SIZE_OF_PAYLOAD, 1203);
+// MCP-05: SIZE_OF_PAYLOAD reduced by 1 due to proposer_id field in common header
+const_assert_eq!(ShredData::SIZE_OF_PAYLOAD, 1202);
 
 // Layout: {common, data} headers | data buffer
 //     | [Merkle root of the previous erasure batch if chained]
@@ -195,8 +196,9 @@ impl ShredData {
             },
         );
         // Shred index in the erasure batch.
+        // MCP-05: fec_set_index offset updated from 79 to 80 due to proposer_id field.
         let index = {
-            let fec_set_index = <[u8; 4]>::try_from(shred.get(79..83)?)
+            let fec_set_index = <[u8; 4]>::try_from(shred.get(80..84)?)
                 .map(u32::from_le_bytes)
                 .ok()?;
             shred::layout::get_index(shred)?
@@ -251,12 +253,14 @@ impl ShredCode {
             },
         );
         // Shred index in the erasure batch.
+        // MCP-05: offsets updated due to proposer_id field:
+        //   num_data_shreds: 83->84, position: 87->88
         let index = {
-            let num_data_shreds = <[u8; 2]>::try_from(shred.get(83..85)?)
+            let num_data_shreds = <[u8; 2]>::try_from(shred.get(84..86)?)
                 .map(u16::from_le_bytes)
                 .map(usize::from)
                 .ok()?;
-            let position = <[u8; 2]>::try_from(shred.get(87..89)?)
+            let position = <[u8; 2]>::try_from(shred.get(88..90)?)
                 .map(u16::from_le_bytes)
                 .map(usize::from)
                 .ok()?;
@@ -725,6 +729,7 @@ pub(super) fn recover(
             slot,
             index: _,
             version,
+            proposer_id: _,
             fec_set_index,
         } = shred.common_header();
         slot == &common_header.slot
@@ -1055,6 +1060,7 @@ pub(crate) fn make_shreds_from_data(
         slot,
         index: next_shred_index,
         version: shred_version,
+        proposer_id: DEFAULT_PROPOSER_ID, // MCP-05: default for non-MCP shreds
         fec_set_index: next_shred_index,
     };
 
@@ -1478,6 +1484,7 @@ mod test {
             slot: 145_865_705,
             index: 1835,
             version: rng.gen(),
+            proposer_id: 0, // MCP-05: proposer_id
             fec_set_index: 1835,
         };
         let data_header = {
@@ -1739,6 +1746,7 @@ mod test {
                 slot,
                 index,
                 version,
+                proposer_id: _,
                 fec_set_index: _,
             } = *shred.common_header();
             let shred_type = ShredType::from(shred_variant);

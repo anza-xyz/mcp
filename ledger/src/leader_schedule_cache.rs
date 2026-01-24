@@ -1,7 +1,9 @@
 use {
     crate::{
         blockstore::Blockstore,
-        leader_schedule::{FixedSchedule, LeaderSchedule},
+        leader_schedule::{
+            FixedSchedule, LeaderSchedule, McpSchedule, ProposerId, RelayId,
+        },
         leader_schedule_utils,
     },
     itertools::Itertools,
@@ -17,6 +19,7 @@ use {
 };
 
 type CachedSchedules = (HashMap<Epoch, Arc<LeaderSchedule>>, VecDeque<u64>);
+type CachedMcpSchedules = (HashMap<Epoch, Arc<McpSchedule>>, VecDeque<Epoch>);
 const MAX_SCHEDULES: usize = 10;
 
 struct CacheCapacity(usize);
@@ -30,6 +33,8 @@ impl Default for CacheCapacity {
 pub struct LeaderScheduleCache {
     // Map from an epoch to a leader schedule for that epoch
     pub cached_schedules: RwLock<CachedSchedules>,
+    // Map from an epoch to an MCP schedule for that epoch
+    cached_mcp_schedules: RwLock<CachedMcpSchedules>,
     epoch_schedule: EpochSchedule,
     max_epoch: RwLock<Epoch>,
     max_schedules: CacheCapacity,
@@ -44,6 +49,7 @@ impl LeaderScheduleCache {
     pub fn new(epoch_schedule: EpochSchedule, root_bank: &Bank) -> Self {
         let cache = Self {
             cached_schedules: RwLock::new((HashMap::new(), VecDeque::new())),
+            cached_mcp_schedules: RwLock::new((HashMap::new(), VecDeque::new())),
             epoch_schedule,
             max_epoch: RwLock::new(0),
             max_schedules: CacheCapacity::default(),
@@ -234,6 +240,123 @@ impl LeaderScheduleCache {
             let first = order.pop_front().unwrap();
             schedules.remove(&first);
         }
+    }
+
+    // ========================================================================
+    // MCP Schedule Methods
+    // ========================================================================
+
+    /// Get the MCP schedule for a slot.
+    pub fn get_mcp_schedule_at_slot(
+        &self,
+        slot: Slot,
+        bank: Option<&Bank>,
+    ) -> Option<Arc<McpSchedule>> {
+        let epoch = self.epoch_schedule.get_epoch(slot);
+        self.get_mcp_epoch_schedule(epoch, bank)
+    }
+
+    /// Get proposers for a slot.
+    pub fn get_proposers_at_slot(
+        &self,
+        slot: Slot,
+        bank: Option<&Bank>,
+    ) -> Option<Vec<Pubkey>> {
+        let (epoch, slot_index) = self.epoch_schedule.get_epoch_and_slot_index(slot);
+        self.get_mcp_epoch_schedule(epoch, bank)
+            .map(|schedule| schedule.get_proposers_at_slot_index(slot_index))
+    }
+
+    /// Get relays for a slot.
+    pub fn get_relays_at_slot(&self, slot: Slot, bank: Option<&Bank>) -> Option<Vec<Pubkey>> {
+        let (epoch, slot_index) = self.epoch_schedule.get_epoch_and_slot_index(slot);
+        self.get_mcp_epoch_schedule(epoch, bank)
+            .map(|schedule| schedule.get_relays_at_slot_index(slot_index))
+    }
+
+    /// Get proposer ID for a pubkey at a slot.
+    pub fn get_proposer_id_at_slot(
+        &self,
+        slot: Slot,
+        pubkey: &Pubkey,
+        bank: Option<&Bank>,
+    ) -> Option<ProposerId> {
+        let (epoch, slot_index) = self.epoch_schedule.get_epoch_and_slot_index(slot);
+        self.get_mcp_epoch_schedule(epoch, bank)
+            .and_then(|schedule| schedule.get_proposer_id(slot_index, pubkey))
+    }
+
+    /// Get relay ID for a pubkey at a slot.
+    pub fn get_relay_id_at_slot(
+        &self,
+        slot: Slot,
+        pubkey: &Pubkey,
+        bank: Option<&Bank>,
+    ) -> Option<RelayId> {
+        let (epoch, slot_index) = self.epoch_schedule.get_epoch_and_slot_index(slot);
+        self.get_mcp_epoch_schedule(epoch, bank)
+            .and_then(|schedule| schedule.get_relay_id(slot_index, pubkey))
+    }
+
+    /// Check if a pubkey is a proposer at a slot.
+    pub fn is_proposer_at_slot(
+        &self,
+        slot: Slot,
+        pubkey: &Pubkey,
+        bank: Option<&Bank>,
+    ) -> bool {
+        self.get_proposer_id_at_slot(slot, pubkey, bank).is_some()
+    }
+
+    /// Check if a pubkey is a relay at a slot.
+    pub fn is_relay_at_slot(&self, slot: Slot, pubkey: &Pubkey, bank: Option<&Bank>) -> bool {
+        self.get_relay_id_at_slot(slot, pubkey, bank).is_some()
+    }
+
+    fn get_mcp_epoch_schedule(&self, epoch: Epoch, bank: Option<&Bank>) -> Option<Arc<McpSchedule>> {
+        // Try cache first
+        if let Some(schedule) = self.cached_mcp_schedules.read().unwrap().0.get(&epoch) {
+            return Some(Arc::clone(schedule));
+        }
+
+        // Compute if we have a bank
+        bank.and_then(|bank| self.compute_mcp_epoch_schedule(epoch, bank))
+    }
+
+    fn compute_mcp_epoch_schedule(&self, epoch: Epoch, bank: &Bank) -> Option<Arc<McpSchedule>> {
+        let stakes = bank.epoch_staked_nodes(epoch)?;
+        let num_slots = bank.get_slots_in_epoch(epoch);
+
+        let schedule = Arc::new(McpSchedule::new(
+            stakes.iter().map(|(pk, stake)| (pk, *stake)),
+            epoch,
+            num_slots,
+        ));
+
+        // Cache the schedule
+        let mut cache = self.cached_mcp_schedules.write().unwrap();
+
+        // Evict old schedules if at capacity
+        while cache.1.len() >= self.max_schedules() {
+            if let Some(old_epoch) = cache.1.pop_front() {
+                cache.0.remove(&old_epoch);
+            }
+        }
+
+        cache.0.insert(epoch, Arc::clone(&schedule));
+        cache.1.push_back(epoch);
+
+        debug!(
+            "Computed MCP schedule for epoch {} with {} slots",
+            epoch, num_slots
+        );
+
+        Some(schedule)
+    }
+
+    /// Get the epoch schedule.
+    pub fn epoch_schedule(&self) -> &EpochSchedule {
+        &self.epoch_schedule
     }
 }
 
