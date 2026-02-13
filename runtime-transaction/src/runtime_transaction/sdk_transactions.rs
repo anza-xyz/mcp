@@ -66,6 +66,7 @@ impl RuntimeTransaction<SanitizedVersionedTransaction> {
                 signature_details,
                 compute_budget_instruction_details,
                 instruction_data_len,
+                mcp_fee_components: None,
             },
         })
     }

@@ -42,7 +42,7 @@ use {
 };
 
 const CLIENT_CHANNEL_BUFFER: usize = 1 << 14;
-const ROUTER_CHANNEL_BUFFER: usize = 64;
+const ROUTER_CHANNEL_BUFFER: usize = 4096;
 const CONNECTION_CACHE_CAPACITY: usize = 3072;
 const ALPN_TURBINE_PROTOCOL_ID: &[u8] = b"solana-turbine";
 

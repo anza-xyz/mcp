@@ -152,6 +152,13 @@ impl ComputeBudgetInstructionDetails {
         })
     }
 
+    pub fn requested_compute_unit_price(&self) -> u64 {
+        self.requested_compute_unit_price
+            .map_or(0, |(_, requested_compute_unit_price)| {
+                requested_compute_unit_price
+            })
+    }
+
     fn process_instruction(&mut self, index: u8, instruction: &SVMInstruction) -> Result<()> {
         let invalid_instruction_data_error =
             TransactionError::InstructionError(index, InstructionError::InvalidInstructionData);

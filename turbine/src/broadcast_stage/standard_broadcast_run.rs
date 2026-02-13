@@ -5,29 +5,48 @@ use {
         broadcast_utils::{self, ReceiveResults},
         *,
     },
-    crate::cluster_nodes::ClusterNodesCache,
+    crate::{cluster_nodes::ClusterNodesCache, mcp_proposer},
+    agave_feature_set as feature_set,
+    agave_transaction_view::{
+        mcp_transaction::McpTransaction, transaction_view::SanitizedTransactionView,
+    },
     crossbeam_channel::Sender,
     solana_entry::block_component::BlockComponent,
+    solana_fee_structure::FeeBudgetLimits,
+    solana_gossip::contact_info::Protocol,
     solana_hash::Hash,
     solana_keypair::Keypair,
     solana_ledger::{
         blockstore_meta::BlockLocation,
+        leader_schedule_cache::LeaderScheduleCache,
+        mcp, mcp_ordering,
         shred::{
             ProcessShredsStats, ReedSolomonCache, Shred, ShredType, Shredder,
             MAX_CODE_SHREDS_PER_SLOT, MAX_DATA_SHREDS_PER_SLOT,
         },
     },
+    solana_metrics::inc_new_counter_error,
+    solana_pubkey::Pubkey,
     solana_runtime::bank::Bank,
+    solana_runtime_transaction::{
+        runtime_transaction::RuntimeTransaction, transaction_meta::StaticMeta,
+    },
     solana_sha256_hasher::hashv,
     solana_time_utils::AtomicInterval,
+    solana_transaction::{sanitized::MessageHash, versioned::VersionedTransaction},
     solana_votor::event::VotorEventSender,
     solana_votor_messages::migration::MigrationStatus,
-    std::{borrow::Cow, sync::RwLock},
-    tokio::sync::mpsc::Sender as AsyncSender,
+    std::{
+        borrow::Cow,
+        collections::{HashMap, HashSet},
+        sync::RwLock,
+    },
+    tokio::sync::mpsc::{error::TrySendError as AsyncTrySendError, Sender as AsyncSender},
 };
 
 #[derive(Clone)]
 pub struct StandardBroadcastRun {
+    identity: Pubkey,
     slot: Slot,
     parent: Slot,
     parent_block_id: Hash,
@@ -49,6 +68,8 @@ pub struct StandardBroadcastRun {
     cluster_nodes_cache: Arc<ClusterNodesCache<BroadcastStage>>,
     reed_solomon_cache: Arc<ReedSolomonCache>,
     migration_status: Arc<MigrationStatus>,
+    mcp_dispatch_state: Arc<Mutex<HashMap<Slot, McpSlotDispatchState>>>,
+    mcp_leader_schedule_cache: Arc<Mutex<Option<LeaderScheduleCache>>>,
 }
 
 #[derive(Debug)]
@@ -56,13 +77,236 @@ enum BroadcastError {
     TooManyShreds,
 }
 
+#[derive(Clone)]
+struct McpPayloadTransaction {
+    wire_bytes: Vec<u8>,
+    execution_class: mcp_ordering::ExecutionClass,
+    ordering_fee: u64,
+    signature: [u8; 64],
+    fee_payer: Pubkey,
+    base_fee: u64,
+    target_proposer: Option<u32>,
+}
+
+struct McpSlotDispatchState {
+    seen_batches: usize,
+    expected_batches: Option<usize>,
+    proposer_states: HashMap<u32, McpProposerDispatchState>,
+}
+
+struct McpProposerDispatchState {
+    payload_transactions: Vec<McpPayloadTransaction>,
+    payload_len_bytes: usize,
+    payer_fee_reservations: HashMap<Pubkey, u64>,
+    seen_signatures: HashSet<[u8; 64]>,
+}
+
+const MCP_DISPATCH_STATE_MAX_SLOTS: usize = 1024;
+const MCP_DISPATCH_STATE_SLOT_RETENTION: Slot = 512;
+const MCP_PAYLOAD_COUNT_PREFIX_BYTES: usize = std::mem::size_of::<u32>();
+const MCP_PAYLOAD_LEN_PREFIX_BYTES: usize = std::mem::size_of::<u32>();
+
+impl Default for McpSlotDispatchState {
+    fn default() -> Self {
+        Self {
+            seen_batches: 0,
+            expected_batches: None,
+            proposer_states: HashMap::new(),
+        }
+    }
+}
+
+impl Default for McpProposerDispatchState {
+    fn default() -> Self {
+        Self {
+            payload_transactions: Vec::new(),
+            // tx_count prefix is always present in encoded payload.
+            payload_len_bytes: MCP_PAYLOAD_COUNT_PREFIX_BYTES,
+            payer_fee_reservations: HashMap::new(),
+            seen_signatures: HashSet::new(),
+        }
+    }
+}
+
+impl McpSlotDispatchState {
+    fn try_push_transaction(
+        &mut self,
+        proposer_index: u32,
+        bank: &Bank,
+        transaction: McpPayloadTransaction,
+    ) -> bool {
+        self.proposer_states
+            .entry(proposer_index)
+            .or_default()
+            .try_push_transaction(bank, transaction)
+    }
+}
+
+impl McpProposerDispatchState {
+    fn try_push_transaction(&mut self, bank: &Bank, transaction: McpPayloadTransaction) -> bool {
+        if self.seen_signatures.contains(&transaction.signature) {
+            // Per-proposer dedup is by signature only.
+            return true;
+        }
+
+        let Some(per_proposer_reservation) =
+            transaction.base_fee.checked_mul(mcp::NUM_PROPOSERS as u64)
+        else {
+            inc_new_counter_error!("mcp-proposer-dispatch-fee-reservation-overflow", 1, 1);
+            return true;
+        };
+        let current_reserved = self
+            .payer_fee_reservations
+            .get(&transaction.fee_payer)
+            .copied()
+            .unwrap_or_default();
+        let Some(next_reserved) = current_reserved.checked_add(per_proposer_reservation) else {
+            inc_new_counter_error!("mcp-proposer-dispatch-fee-reservation-overflow", 1, 1);
+            return true;
+        };
+        if bank.get_balance(&transaction.fee_payer) < next_reserved {
+            inc_new_counter_error!("mcp-proposer-dispatch-insufficient-funds", 1, 1);
+            return true;
+        }
+
+        let Some(tx_wire_len) =
+            MCP_PAYLOAD_LEN_PREFIX_BYTES.checked_add(transaction.wire_bytes.len())
+        else {
+            inc_new_counter_error!("mcp-proposer-dispatch-payload-reservation-overflow", 1, 1);
+            return false;
+        };
+        let Some(next_payload_len) = self.payload_len_bytes.checked_add(tx_wire_len) else {
+            inc_new_counter_error!("mcp-proposer-dispatch-payload-reservation-overflow", 1, 1);
+            return false;
+        };
+        if next_payload_len > mcp_proposer::MCP_MAX_PAYLOAD_SIZE {
+            inc_new_counter_error!("mcp-proposer-dispatch-payload-full", 1, 1);
+            return false;
+        }
+
+        let signature = transaction.signature;
+        let fee_payer = transaction.fee_payer;
+        self.payload_transactions.push(transaction);
+        self.payload_len_bytes = next_payload_len;
+        self.payer_fee_reservations.insert(fee_payer, next_reserved);
+        self.seen_signatures.insert(signature);
+        true
+    }
+}
+
+fn encode_mcp_payload(transactions: Vec<Vec<u8>>) -> Option<Vec<u8>> {
+    let tx_count = u32::try_from(transactions.len()).ok()?;
+    let mut out = Vec::with_capacity(transactions.iter().try_fold(
+        MCP_PAYLOAD_COUNT_PREFIX_BYTES,
+        |acc, tx| {
+            let tx_len_field = MCP_PAYLOAD_LEN_PREFIX_BYTES.checked_add(tx.len())?;
+            acc.checked_add(tx_len_field)
+        },
+    )?);
+    out.extend_from_slice(&tx_count.to_le_bytes());
+    for tx in transactions {
+        let tx_len = u32::try_from(tx.len()).ok()?;
+        out.extend_from_slice(&tx_len.to_le_bytes());
+        out.extend_from_slice(&tx);
+    }
+    Some(out)
+}
+
 impl StandardBroadcastRun {
-    pub(super) fn new(shred_version: u16, migration_status: Arc<MigrationStatus>) -> Self {
+    const MCP_DISPATCH_SEND_RETRY_LIMIT: usize = 3;
+
+    fn mcp_payload_transaction_from_entry_tx(
+        bank: &Bank,
+        transaction: &VersionedTransaction,
+    ) -> Option<McpPayloadTransaction> {
+        let solana_wire_bytes = bincode::serialize(transaction).ok()?;
+
+        if let Ok(mcp_transaction) = McpTransaction::from_bytes_compat(&solana_wire_bytes) {
+            let wire_bytes = mcp_transaction.to_bytes();
+            let mut signature = [0u8; 64];
+            signature.copy_from_slice(mcp_transaction.signatures.first()?.as_ref());
+            let fee_payer = *mcp_transaction.addresses.first()?;
+            let signature_fee = u64::try_from(mcp_transaction.signatures.len())
+                .ok()?
+                .saturating_mul(bank.fee_structure().lamports_per_signature);
+            let inclusion_fee = u64::from(mcp_transaction.inclusion_fee().unwrap_or_default());
+            let ordering_fee = mcp_transaction.ordering_fee_with_fallback();
+            let target_proposer = mcp_transaction.target_proposer();
+            let base_fee = signature_fee
+                .saturating_add(inclusion_fee)
+                .saturating_add(ordering_fee);
+
+            return Some(McpPayloadTransaction {
+                wire_bytes,
+                execution_class: mcp_ordering::ExecutionClass::Mcp,
+                ordering_fee,
+                signature,
+                fee_payer,
+                base_fee,
+                target_proposer,
+            });
+        }
+
+        let view =
+            SanitizedTransactionView::try_new_sanitized(solana_wire_bytes.as_slice()).ok()?;
+        let mut signature = [0u8; 64];
+        signature.copy_from_slice(view.signatures().first()?.as_ref());
+        let runtime_tx = RuntimeTransaction::<SanitizedTransactionView<_>>::try_from(
+            view,
+            MessageHash::Compute,
+            None,
+        )
+        .ok()?;
+        let ordering_fee = runtime_tx
+            .compute_budget_instruction_details()
+            .requested_compute_unit_price();
+        let prioritization_fee = runtime_tx
+            .compute_budget_instruction_details()
+            .sanitize_and_convert_to_compute_budget_limits(&bank.feature_set)
+            .ok()
+            .map(|limits| u64::from(FeeBudgetLimits::from(limits).prioritization_fee))
+            .unwrap_or_default();
+        let signature_fee = runtime_tx
+            .signature_details()
+            .total_signatures()
+            .saturating_mul(bank.fee_structure().lamports_per_signature);
+        let base_fee = signature_fee.saturating_add(prioritization_fee);
+        let fee_payer = *transaction.message.static_account_keys().first()?;
+
+        Some(McpPayloadTransaction {
+            wire_bytes: solana_wire_bytes,
+            execution_class: mcp_ordering::ExecutionClass::Legacy,
+            ordering_fee,
+            signature,
+            fee_payer,
+            base_fee,
+            target_proposer: None,
+        })
+    }
+
+    fn order_mcp_payload_transactions(transactions: Vec<McpPayloadTransaction>) -> Vec<Vec<u8>> {
+        mcp_ordering::order_batches_mcp_policy(
+            vec![(0u32, transactions)],
+            |tx| tx.execution_class,
+            |tx| tx.ordering_fee,
+            |tx| tx.signature,
+        )
+        .into_iter()
+        .map(|tx| tx.wire_bytes)
+        .collect()
+    }
+
+    pub(super) fn new(
+        identity: Pubkey,
+        shred_version: u16,
+        migration_status: Arc<MigrationStatus>,
+    ) -> Self {
         let cluster_nodes_cache = Arc::new(ClusterNodesCache::<BroadcastStage>::new(
             CLUSTER_NODES_CACHE_NUM_EPOCH_CAP,
             CLUSTER_NODES_CACHE_TTL,
         ));
         Self {
+            identity,
             slot: Slot::MAX,
             parent: Slot::MAX,
             parent_block_id: Hash::default(),
@@ -82,6 +326,8 @@ impl StandardBroadcastRun {
             cluster_nodes_cache,
             reed_solomon_cache: Arc::<ReedSolomonCache>::default(),
             migration_status,
+            mcp_dispatch_state: Arc::default(),
+            mcp_leader_schedule_cache: Arc::default(),
         }
     }
 
@@ -400,6 +646,11 @@ impl StandardBroadcastRun {
         get_leader_schedule_time.stop();
 
         let mut coding_send_time = Measure::start("broadcast_coding_send");
+        self.maybe_record_mcp_payload_batch(
+            &bank,
+            &receive_results.component,
+            num_expected_batches,
+        );
 
         let shreds = Arc::new(shreds);
         debug_assert!(shreds.iter().all(|shred| shred.slot() == bank.slot()));
@@ -495,7 +746,7 @@ impl StandardBroadcastRun {
         &mut self,
         sock: BroadcastSocket,
         cluster_info: &ClusterInfo,
-        shreds: Arc<Vec<Shred>>,
+        shreds: &Arc<Vec<Shred>>,
         broadcast_shred_batch_info: Option<BroadcastShredBatchInfo>,
         bank_forks: &RwLock<BankForks>,
         quic_endpoint_sender: &AsyncSender<(SocketAddr, Bytes)>,
@@ -554,6 +805,317 @@ impl StandardBroadcastRun {
             slot_broadcast_time,
         );
     }
+
+    fn maybe_record_mcp_payload_batch(
+        &self,
+        bank: &Bank,
+        component: &BlockComponent,
+        num_expected_batches: Option<usize>,
+    ) {
+        if !bank
+            .feature_set
+            .activated_slot(&feature_set::mcp_protocol_v1::id())
+            .is_some_and(|activated_slot| bank.slot() >= activated_slot)
+        {
+            return;
+        }
+
+        let proposer_indices = LeaderScheduleCache::new_from_bank(bank).proposer_indices_at_slot(
+            bank.slot(),
+            &self.identity,
+            Some(bank),
+        );
+        if proposer_indices.is_empty() {
+            return;
+        }
+
+        let mut state = self.mcp_dispatch_state.lock().unwrap();
+        let min_retained_slot = bank
+            .slot()
+            .saturating_sub(MCP_DISPATCH_STATE_SLOT_RETENTION);
+        state.retain(|tracked_slot, _| *tracked_slot >= min_retained_slot);
+        if state.len() >= MCP_DISPATCH_STATE_MAX_SLOTS && !state.contains_key(&bank.slot()) {
+            if let Some(oldest_slot) = state.keys().min().copied() {
+                state.remove(&oldest_slot);
+            }
+        }
+        let slot_state = state.entry(bank.slot()).or_default();
+        slot_state.seen_batches = slot_state.seen_batches.saturating_add(1);
+        if let Some(expected_batches) = num_expected_batches {
+            slot_state.expected_batches = Some(expected_batches);
+        }
+        let BlockComponent::EntryBatch(entries) = component else {
+            return;
+        };
+        for entry in entries {
+            for tx in &entry.transactions {
+                let Some(payload_transaction) =
+                    Self::mcp_payload_transaction_from_entry_tx(bank, tx)
+                else {
+                    warn!(
+                        "MCP proposer payload metadata extraction failed for slot {}",
+                        bank.slot()
+                    );
+                    continue;
+                };
+                if let Some(target_proposer) = payload_transaction.target_proposer {
+                    if proposer_indices.contains(&target_proposer) {
+                        let _ = slot_state.try_push_transaction(
+                            target_proposer,
+                            bank,
+                            payload_transaction,
+                        );
+                    }
+                    continue;
+                }
+
+                for proposer_index in proposer_indices.iter().copied() {
+                    let _ = slot_state.try_push_transaction(
+                        proposer_index,
+                        bank,
+                        payload_transaction.clone(),
+                    );
+                }
+            }
+        }
+    }
+
+    fn maybe_dispatch_mcp_shreds(
+        &self,
+        batch_info: &Option<BroadcastShredBatchInfo>,
+        cluster_info: &ClusterInfo,
+        bank_forks: &RwLock<BankForks>,
+        sock: BroadcastSocket,
+        quic_endpoint_sender: &AsyncSender<(SocketAddr, Bytes)>,
+    ) {
+        enum McpRelayTarget {
+            Quic(SocketAddr),
+            Udp(SocketAddr),
+        }
+
+        let Some(batch_info) = batch_info else {
+            // Retransmit batches have no slot metadata and are not MCP proposer outputs.
+            return;
+        };
+        let slot = batch_info.slot;
+        let (feature_active, working_bank, root_bank, root_slot) = {
+            let bank_forks = bank_forks.read().unwrap();
+            let bank = bank_forks
+                .get(slot)
+                .unwrap_or_else(|| bank_forks.root_bank());
+            let feature_active = bank
+                .feature_set
+                .activated_slot(&feature_set::mcp_protocol_v1::id())
+                .is_some_and(|activated_slot| slot >= activated_slot);
+            (
+                feature_active,
+                bank,
+                bank_forks.root_bank(),
+                bank_forks.root(),
+            )
+        };
+        if !feature_active {
+            return;
+        }
+
+        let identity = cluster_info.id();
+        let (proposer_indices, relay_schedule) = {
+            let mut cache = self.mcp_leader_schedule_cache.lock().unwrap();
+            let cache = cache.get_or_insert_with(|| LeaderScheduleCache::new_from_bank(&root_bank));
+            cache.set_root(&root_bank);
+            (
+                cache.proposer_indices_at_slot(slot, &identity, Some(&working_bank)),
+                cache.relays_at_slot(slot, Some(&working_bank)),
+            )
+        };
+        if proposer_indices.is_empty() {
+            return;
+        }
+
+        let maybe_ordered_payloads_by_proposer = {
+            let mut state = self.mcp_dispatch_state.lock().unwrap();
+            let min_retained_slot = root_slot.saturating_sub(MCP_DISPATCH_STATE_SLOT_RETENTION);
+            state.retain(|tracked_slot, _| *tracked_slot >= min_retained_slot);
+            let Some(slot_state) = state.get(&slot) else {
+                return;
+            };
+            let is_slot_complete = slot_state
+                .expected_batches
+                .map(|num_expected_batches| slot_state.seen_batches >= num_expected_batches)
+                .unwrap_or(false);
+            if is_slot_complete {
+                state.remove(&slot).map(|slot_state| {
+                    slot_state
+                        .proposer_states
+                        .into_iter()
+                        .map(|(proposer_index, proposer_state)| {
+                            (
+                                proposer_index,
+                                Self::order_mcp_payload_transactions(
+                                    proposer_state.payload_transactions,
+                                ),
+                            )
+                        })
+                        .collect::<HashMap<_, _>>()
+                })
+            } else {
+                None
+            }
+        };
+        let Some(mut ordered_payloads_by_proposer) = maybe_ordered_payloads_by_proposer else {
+            return;
+        };
+
+        let relay_schedule = match relay_schedule {
+            Some(relays) => relays,
+            None => {
+                warn!("MCP proposer dispatch skipped for slot {slot}: relay schedule unavailable");
+                return;
+            }
+        };
+        if relay_schedule.len() != mcp_proposer::MCP_NUM_RELAYS {
+            warn!(
+                "MCP proposer dispatch skipped for slot {}: expected {} relay indices, got {}",
+                slot,
+                mcp_proposer::MCP_NUM_RELAYS,
+                relay_schedule.len(),
+            );
+            return;
+        }
+
+        let relay_targets: Vec<_> = relay_schedule
+            .into_iter()
+            .map(|relay_pubkey| {
+                cluster_info
+                    .lookup_contact_info(&relay_pubkey, |node| {
+                        if relay_pubkey == identity {
+                            node.tvu(Protocol::UDP)
+                                .map(McpRelayTarget::Udp)
+                                .or_else(|| node.tvu(Protocol::QUIC).map(McpRelayTarget::Quic))
+                        } else {
+                            node.tvu(Protocol::QUIC).map(McpRelayTarget::Quic)
+                        }
+                    })
+                    .flatten()
+            })
+            .collect();
+        let available = relay_targets.iter().filter(|addr| addr.is_some()).count();
+        if available == 0 {
+            warn!(
+                "MCP proposer dispatch skipped for slot {}: none of {} scheduled relays have reachable TVU addresses",
+                slot,
+                mcp_proposer::MCP_NUM_RELAYS,
+            );
+            return;
+        }
+        if available < mcp_proposer::MCP_NUM_RELAYS {
+            warn!(
+                "MCP proposer dispatch slot {}: {} of {} scheduled relays have reachable TVU addresses",
+                slot,
+                available,
+                mcp_proposer::MCP_NUM_RELAYS,
+            );
+        }
+
+        let proposer_keypair = {
+            let keypair = cluster_info.keypair();
+            Arc::clone(&*keypair)
+        };
+        for proposer_index in proposer_indices {
+            let payload_transactions = ordered_payloads_by_proposer
+                .remove(&proposer_index)
+                .unwrap_or_default();
+            let Some(payload_bytes) = encode_mcp_payload(payload_transactions) else {
+                warn!(
+                    "MCP proposer dispatch skipped for slot {} proposer {}: invalid payload framing",
+                    slot, proposer_index
+                );
+                continue;
+            };
+            let shred_payloads = match mcp_proposer::encode_payload_to_mcp_shreds(&payload_bytes) {
+                Ok(shreds) => shreds,
+                Err(err) => {
+                    warn!(
+                        "MCP proposer dispatch skipped for slot {} proposer {}: {}",
+                        slot, proposer_index, err
+                    );
+                    continue;
+                }
+            };
+            let messages = match mcp_proposer::build_shred_messages(
+                slot,
+                proposer_index,
+                &shred_payloads,
+                proposer_keypair.as_ref(),
+            ) {
+                Ok(messages) => messages,
+                Err(err) => {
+                    warn!("MCP proposer dispatch skipped for slot {slot}: {err}");
+                    continue;
+                }
+            };
+            for (relay_target, message) in relay_targets.iter().zip(messages.iter()) {
+                let Some(relay_target) = relay_target else {
+                    continue;
+                };
+                let (send_ok, relay_addr) = match relay_target {
+                    McpRelayTarget::Quic(relay_addr) => (
+                        Self::try_send_mcp_dispatch_message(
+                            quic_endpoint_sender,
+                            *relay_addr,
+                            Bytes::copy_from_slice(message),
+                        ),
+                        relay_addr,
+                    ),
+                    McpRelayTarget::Udp(relay_addr) => (
+                        Self::try_send_mcp_dispatch_message_udp(sock, *relay_addr, message),
+                        relay_addr,
+                    ),
+                };
+                if !send_ok {
+                    inc_new_counter_error!("mcp-proposer-dispatch-send-dropped", 1, 1);
+                    warn!(
+                        "MCP proposer dispatch dropped send for slot {} to {}",
+                        slot, relay_addr
+                    );
+                }
+            }
+        }
+    }
+
+    fn try_send_mcp_dispatch_message(
+        quic_endpoint_sender: &AsyncSender<(SocketAddr, Bytes)>,
+        relay_addr: SocketAddr,
+        bytes: Bytes,
+    ) -> bool {
+        let mut send_item = (relay_addr, bytes);
+        for attempt in 0..=Self::MCP_DISPATCH_SEND_RETRY_LIMIT {
+            match quic_endpoint_sender.try_send(send_item) {
+                Ok(()) => return true,
+                Err(AsyncTrySendError::Closed(_)) => return false,
+                Err(AsyncTrySendError::Full(returned)) => {
+                    if attempt == Self::MCP_DISPATCH_SEND_RETRY_LIMIT {
+                        return false;
+                    }
+                    send_item = returned;
+                    let backoff_micros = 50u64.saturating_mul((attempt + 1) as u64);
+                    std::thread::sleep(std::time::Duration::from_micros(backoff_micros));
+                }
+            }
+        }
+        false
+    }
+
+    fn try_send_mcp_dispatch_message_udp(
+        sock: BroadcastSocket,
+        relay_addr: SocketAddr,
+        bytes: &[u8],
+    ) -> bool {
+        match sock {
+            BroadcastSocket::Udp(sock) => sock.send_to(bytes, relay_addr).is_ok(),
+            BroadcastSocket::Xdp(_) => false,
+        }
+    }
 }
 
 impl BroadcastRun for StandardBroadcastRun {
@@ -596,11 +1158,19 @@ impl BroadcastRun for StandardBroadcastRun {
         self.broadcast(
             sock,
             cluster_info,
-            shreds,
-            batch_info,
+            &shreds,
+            batch_info.clone(),
             bank_forks,
             quic_endpoint_sender,
-        )
+        )?;
+        self.maybe_dispatch_mcp_shreds(
+            &batch_info,
+            cluster_info,
+            bank_forks,
+            sock,
+            quic_endpoint_sender,
+        );
+        Ok(())
     }
     fn record(&mut self, receiver: &RecordReceiver, blockstore: &Blockstore) -> Result<()> {
         let (shreds, slot_start_ts) = receiver.recv()?;
@@ -614,14 +1184,15 @@ mod test {
     use {
         super::*,
         rand::Rng,
+        solana_account::{AccountSharedData, WritableAccount},
         solana_entry::entry::create_ticks,
         solana_genesis_config::GenesisConfig,
-        solana_gossip::{cluster_info::ClusterInfo, node::Node},
+        solana_gossip::{cluster_info::ClusterInfo, contact_info::ContactInfo},
         solana_hash::Hash,
         solana_keypair::Keypair,
         solana_ledger::{
             blockstore::{Blockstore, BlockstoreError},
-            genesis_utils::create_genesis_config,
+            genesis_utils::{create_genesis_config, create_genesis_config_with_leader},
             get_tmp_ledger_path,
             shred::{max_ticks_per_n_shreds, DATA_SHREDS_PER_FEC_BLOCK},
         },
@@ -629,13 +1200,18 @@ mod test {
         solana_runtime::bank::Bank,
         solana_signer::Signer,
         solana_streamer::socket::SocketAddrSpace,
-        std::{ops::Deref, sync::Arc, time::Duration},
+        std::{
+            ops::Deref,
+            sync::Arc,
+            time::{Duration, Instant},
+        },
         test_case::test_case,
     };
 
     #[allow(clippy::type_complexity)]
-    fn setup(
+    fn setup_with_mcp_feature(
         num_shreds_per_slot: Slot,
+        mcp_feature_active: bool,
     ) -> (
         Arc<Blockstore>,
         GenesisConfig,
@@ -652,9 +1228,9 @@ mod test {
         );
         let leader_keypair = Arc::new(Keypair::new());
         let leader_pubkey = leader_keypair.pubkey();
-        let leader_info = Node::new_localhost_with_pubkey(&leader_pubkey);
+        let leader_info = ContactInfo::new_localhost(&leader_pubkey, 0);
         let cluster_info = Arc::new(ClusterInfo::new(
-            leader_info.info,
+            leader_info,
             leader_keypair.clone(),
             SocketAddrSpace::Unspecified,
         ));
@@ -662,7 +1238,10 @@ mod test {
         let mut genesis_config = create_genesis_config(10_000).genesis_config;
         genesis_config.ticks_per_slot = max_ticks_per_n_shreds(num_shreds_per_slot, None) + 1;
 
-        let bank = Bank::new_for_tests(&genesis_config);
+        let mut bank = Bank::new_for_tests(&genesis_config);
+        if mcp_feature_active {
+            bank.activate_feature(&feature_set::mcp_protocol_v1::id());
+        }
         let bank_forks = BankForks::new_rw_arc(bank);
         let bank0 = bank_forks.read().unwrap().root_bank();
         (
@@ -676,11 +1255,335 @@ mod test {
         )
     }
 
+    #[allow(clippy::type_complexity)]
+    fn setup(
+        num_shreds_per_slot: Slot,
+    ) -> (
+        Arc<Blockstore>,
+        GenesisConfig,
+        Arc<ClusterInfo>,
+        Arc<Bank>,
+        Arc<Keypair>,
+        UdpSocket,
+        Arc<RwLock<BankForks>>,
+    ) {
+        setup_with_mcp_feature(num_shreds_per_slot, false)
+    }
+
+    fn make_payload_tx(
+        wire_len: usize,
+        signature_byte: u8,
+        fee_payer: Pubkey,
+        base_fee: u64,
+        ordering_fee: u64,
+    ) -> McpPayloadTransaction {
+        McpPayloadTransaction {
+            wire_bytes: vec![signature_byte; wire_len],
+            execution_class: mcp_ordering::ExecutionClass::Legacy,
+            ordering_fee,
+            signature: [signature_byte; 64],
+            fee_payer,
+            base_fee,
+            target_proposer: None,
+        }
+    }
+
+    #[test]
+    fn test_encode_mcp_payload_frames_transactions() {
+        let tx0 = vec![1u8, 2, 3];
+        let tx1 = vec![4u8, 5];
+        let payload = encode_mcp_payload(vec![tx0.clone(), tx1.clone()]).unwrap();
+
+        let mut expected = Vec::new();
+        expected.extend_from_slice(&(2u32).to_le_bytes());
+        expected.extend_from_slice(&(tx0.len() as u32).to_le_bytes());
+        expected.extend_from_slice(&tx0);
+        expected.extend_from_slice(&(tx1.len() as u32).to_le_bytes());
+        expected.extend_from_slice(&tx1);
+        assert_eq!(payload, expected);
+    }
+
+    #[test]
+    fn test_slot_dispatch_state_enforces_payload_bound_with_framing_overhead() {
+        let bank = Arc::new(Bank::new_for_tests(
+            &create_genesis_config(10_000).genesis_config,
+        ));
+        let mut state = McpSlotDispatchState::default();
+        let max_size_tx = make_payload_tx(
+            mcp_proposer::MCP_MAX_PAYLOAD_SIZE,
+            1,
+            Pubkey::new_unique(),
+            0,
+            0,
+        );
+        assert!(!state.try_push_transaction(0, bank.as_ref(), max_size_tx));
+
+        let valid = make_payload_tx(
+            mcp_proposer::MCP_MAX_PAYLOAD_SIZE - 8,
+            2,
+            Pubkey::new_unique(),
+            0,
+            0,
+        );
+        assert!(state.try_push_transaction(0, bank.as_ref(), valid));
+    }
+
+    #[test]
+    fn test_slot_dispatch_state_dedups_by_signature() {
+        let bank = Arc::new(Bank::new_for_tests(
+            &create_genesis_config(10_000).genesis_config,
+        ));
+        let mut state = McpSlotDispatchState::default();
+        let fee_payer = Pubkey::new_unique();
+
+        let first = make_payload_tx(16, 7, fee_payer, 0, 0);
+        assert!(state.try_push_transaction(0, bank.as_ref(), first));
+        let duplicate = make_payload_tx(32, 7, fee_payer, 0, 100);
+        assert!(state.try_push_transaction(0, bank.as_ref(), duplicate));
+
+        assert_eq!(
+            state
+                .proposer_states
+                .get(&0)
+                .unwrap()
+                .payload_transactions
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn test_slot_dispatch_state_requires_num_proposers_fee_reservation() {
+        let bank = Arc::new(Bank::new_for_tests(
+            &create_genesis_config(10_000).genesis_config,
+        ));
+        let fee_payer = Pubkey::new_unique();
+        let mut account = AccountSharedData::new(0, 0, &Pubkey::default());
+        account.set_lamports((mcp::NUM_PROPOSERS as u64).saturating_sub(1));
+        bank.store_account(&fee_payer, &account);
+
+        let mut state = McpSlotDispatchState::default();
+        let rejected = make_payload_tx(16, 3, fee_payer, 1, 0);
+        assert!(state.try_push_transaction(0, bank.as_ref(), rejected));
+        assert!(state
+            .proposer_states
+            .get(&0)
+            .map_or(true, |state| state.payload_transactions.is_empty()));
+
+        account.set_lamports(mcp::NUM_PROPOSERS as u64);
+        bank.store_account(&fee_payer, &account);
+        let accepted = make_payload_tx(16, 4, fee_payer, 1, 0);
+        assert!(state.try_push_transaction(0, bank.as_ref(), accepted));
+        assert_eq!(
+            state
+                .proposer_states
+                .get(&0)
+                .unwrap()
+                .payload_transactions
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn test_slot_dispatch_state_dedups_within_each_proposer_only() {
+        let bank = Arc::new(Bank::new_for_tests(
+            &create_genesis_config(10_000).genesis_config,
+        ));
+        let mut state = McpSlotDispatchState::default();
+        let fee_payer = Pubkey::new_unique();
+
+        let first = make_payload_tx(16, 7, fee_payer, 0, 0);
+        let duplicate = make_payload_tx(32, 7, fee_payer, 0, 0);
+        assert!(state.try_push_transaction(0, bank.as_ref(), first.clone()));
+        assert!(state.try_push_transaction(0, bank.as_ref(), duplicate));
+        assert!(state.try_push_transaction(1, bank.as_ref(), first));
+
+        assert_eq!(
+            state
+                .proposer_states
+                .get(&0)
+                .unwrap()
+                .payload_transactions
+                .len(),
+            1
+        );
+        assert_eq!(
+            state
+                .proposer_states
+                .get(&1)
+                .unwrap()
+                .payload_transactions
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn test_order_mcp_payload_transactions_uses_b2_policy() {
+        let fee_payer = Pubkey::new_unique();
+        let ordered = StandardBroadcastRun::order_mcp_payload_transactions(vec![
+            make_payload_tx(1, 9, fee_payer, 0, 1),
+            make_payload_tx(1, 1, fee_payer, 0, 7),
+            make_payload_tx(1, 2, fee_payer, 0, 7),
+        ]);
+
+        // Higher ordering_fee first, then signature bytes ascending for ties.
+        assert_eq!(ordered, vec![vec![1u8], vec![2u8], vec![9u8]]);
+    }
+
+    #[test]
+    fn test_maybe_dispatch_mcp_shreds_removes_complete_slot_payload_state() {
+        let leader_keypair = Arc::new(Keypair::new());
+        let mut leader_info = ContactInfo::new_localhost(&leader_keypair.pubkey(), 0);
+        // Force QUIC-only relay targets so dispatch fanout is observable via
+        // the QUIC endpoint channel in this unit test.
+        leader_info.remove_tvu();
+        let relay_tvu_quic = bind_to_localhost_unique().expect("should bind");
+        let relay_tvu_quic_addr = relay_tvu_quic.local_addr().expect("should have local addr");
+        drop(relay_tvu_quic);
+        leader_info
+            .set_tvu(Protocol::QUIC, relay_tvu_quic_addr)
+            .expect("should set QUIC TVU address");
+        let cluster_info = Arc::new(ClusterInfo::new(
+            leader_info,
+            leader_keypair.clone(),
+            SocketAddrSpace::Unspecified,
+        ));
+        let mut genesis_config =
+            create_genesis_config_with_leader(10_000, &leader_keypair.pubkey(), 1_000)
+                .genesis_config;
+        genesis_config.ticks_per_slot =
+            max_ticks_per_n_shreds(DATA_SHREDS_PER_FEC_BLOCK as u64, None) + 1;
+        let mut bank = Bank::new_for_tests(&genesis_config);
+        bank.activate_feature(&feature_set::mcp_protocol_v1::id());
+        let bank_forks = BankForks::new_rw_arc(bank);
+        let bank = bank_forks.read().unwrap().root_bank();
+        let (quic_endpoint_sender, mut quic_endpoint_receiver) =
+            tokio::sync::mpsc::channel(/*capacity:*/ 4096);
+        let dispatch_socket = bind_to_localhost_unique().expect("should bind");
+
+        let standard_broadcast_run = StandardBroadcastRun::new(
+            leader_keypair.pubkey(),
+            0,
+            Arc::new(MigrationStatus::post_migration_status()),
+        );
+        let mut slot_state = McpSlotDispatchState::default();
+        slot_state.seen_batches = 1;
+        slot_state.expected_batches = Some(1);
+        assert!(slot_state.try_push_transaction(
+            0,
+            bank.as_ref(),
+            make_payload_tx(4, 5, Pubkey::new_unique(), 0, 0),
+        ));
+        standard_broadcast_run
+            .mcp_dispatch_state
+            .lock()
+            .unwrap()
+            .insert(bank.slot(), slot_state);
+
+        let batch_info = Some(BroadcastShredBatchInfo {
+            slot: bank.slot(),
+            num_expected_batches: Some(1),
+            slot_start_ts: Instant::now(),
+            was_interrupted: false,
+        });
+        standard_broadcast_run.maybe_dispatch_mcp_shreds(
+            &batch_info,
+            &cluster_info,
+            &bank_forks,
+            BroadcastSocket::Udp(&dispatch_socket),
+            &quic_endpoint_sender,
+        );
+
+        assert!(standard_broadcast_run
+            .mcp_dispatch_state
+            .lock()
+            .unwrap()
+            .get(&bank.slot())
+            .is_none());
+
+        let expected_dispatch_count = {
+            let cache = LeaderScheduleCache::new_from_bank(bank.as_ref());
+            let proposer_indices =
+                cache.proposer_indices_at_slot(bank.slot(), &leader_keypair.pubkey(), Some(&bank));
+            let relay_schedule = cache
+                .relays_at_slot(bank.slot(), Some(&bank))
+                .expect("relay schedule should be available when MCP feature is active");
+            let quic_targets = relay_schedule
+                .iter()
+                .filter(|relay_pubkey| **relay_pubkey == leader_keypair.pubkey())
+                .count();
+            proposer_indices.len() * quic_targets
+        };
+        assert!(expected_dispatch_count > 0);
+
+        let mut dispatch_count = 0usize;
+        while quic_endpoint_receiver.try_recv().is_ok() {
+            dispatch_count += 1;
+        }
+        assert_eq!(dispatch_count, expected_dispatch_count);
+    }
+
+    #[test]
+    fn test_try_send_mcp_dispatch_message_succeeds_when_channel_has_capacity() {
+        let (quic_endpoint_sender, mut quic_endpoint_receiver) =
+            tokio::sync::mpsc::channel(/*capacity:*/ 1);
+        let relay_addr = "127.0.0.1:1234".parse().unwrap();
+        let payload = Bytes::from_static(&[1u8, 2, 3]);
+
+        assert!(StandardBroadcastRun::try_send_mcp_dispatch_message(
+            &quic_endpoint_sender,
+            relay_addr,
+            payload.clone(),
+        ));
+
+        let (received_addr, received_payload) = quic_endpoint_receiver.try_recv().unwrap();
+        assert_eq!(received_addr, relay_addr);
+        assert_eq!(received_payload, payload);
+    }
+
+    #[test]
+    fn test_try_send_mcp_dispatch_message_retries_then_fails_on_full_channel() {
+        let (quic_endpoint_sender, mut quic_endpoint_receiver) =
+            tokio::sync::mpsc::channel(/*capacity:*/ 1);
+        let first_addr = "127.0.0.1:1234".parse().unwrap();
+        let first_payload = Bytes::from_static(&[7u8]);
+        quic_endpoint_sender
+            .try_send((first_addr, first_payload.clone()))
+            .unwrap();
+
+        let second_addr = "127.0.0.1:5678".parse().unwrap();
+        let second_payload = Bytes::from_static(&[9u8]);
+        assert!(!StandardBroadcastRun::try_send_mcp_dispatch_message(
+            &quic_endpoint_sender,
+            second_addr,
+            second_payload,
+        ));
+
+        // The original queued message remains intact when retries are exhausted.
+        let (received_addr, received_payload) = quic_endpoint_receiver.try_recv().unwrap();
+        assert_eq!(received_addr, first_addr);
+        assert_eq!(received_payload, first_payload);
+    }
+
+    #[test]
+    fn test_try_send_mcp_dispatch_message_fails_when_channel_closed() {
+        let (quic_endpoint_sender, quic_endpoint_receiver) = tokio::sync::mpsc::channel(1);
+        drop(quic_endpoint_receiver);
+
+        assert!(!StandardBroadcastRun::try_send_mcp_dispatch_message(
+            &quic_endpoint_sender,
+            "127.0.0.1:1234".parse().unwrap(),
+            Bytes::from_static(&[1u8]),
+        ));
+    }
+
     #[test_case(MigrationStatus::default(); "pre_migration")]
     #[test_case(MigrationStatus::post_migration_status(); "post_migration")]
     fn test_interrupted_slot_last_shred(migration_status: MigrationStatus) {
         let keypair = Arc::new(Keypair::new());
-        let mut run = StandardBroadcastRun::new(0, Arc::new(migration_status));
+        let mut run = StandardBroadcastRun::new(keypair.pubkey(), 0, Arc::new(migration_status));
         assert!(run.completed);
 
         // Set up the slot to be interrupted
@@ -740,7 +1643,8 @@ mod test {
         };
 
         // Step 1: Make an incomplete transmission for slot 0
-        let mut standard_broadcast_run = StandardBroadcastRun::new(0, Arc::new(migration_status));
+        let mut standard_broadcast_run =
+            StandardBroadcastRun::new(leader_keypair.pubkey(), 0, Arc::new(migration_status));
         standard_broadcast_run
             .test_process_receive_results(
                 &leader_keypair,
@@ -885,7 +1789,8 @@ mod test {
         let (ssend, _srecv) = unbounded();
         let (cbsend, _) = unbounded();
         let mut last_tick_height = 0;
-        let mut standard_broadcast_run = StandardBroadcastRun::new(0, Arc::new(migration_status));
+        let mut standard_broadcast_run =
+            StandardBroadcastRun::new(leader_keypair.pubkey(), 0, Arc::new(migration_status));
         let mut process_ticks = |num_ticks| {
             let ticks = create_ticks(num_ticks, 0, genesis_config.hash());
             last_tick_height += (ticks.len() - 1) as u64;
@@ -948,7 +1853,8 @@ mod test {
             last_tick_height: ticks.len() as u64,
         };
 
-        let mut standard_broadcast_run = StandardBroadcastRun::new(0, Arc::new(migration_status));
+        let mut standard_broadcast_run =
+            StandardBroadcastRun::new(leader_keypair.pubkey(), 0, Arc::new(migration_status));
         standard_broadcast_run
             .test_process_receive_results(
                 &leader_keypair,
@@ -968,7 +1874,7 @@ mod test {
     fn entries_to_shreds_max(migration_status: MigrationStatus) {
         agave_logger::setup();
         let keypair = Keypair::new();
-        let mut bs = StandardBroadcastRun::new(0, Arc::new(migration_status));
+        let mut bs = StandardBroadcastRun::new(keypair.pubkey(), 0, Arc::new(migration_status));
         bs.slot = 1;
         bs.parent = 0;
         let entries = create_ticks(10_000, 1, solana_hash::Hash::default());

@@ -11,5 +11,6 @@ edition = { workspace = true }
 
 [dependencies]
 agave-feature-set = { workspace = true }
+agave-transaction-view = { workspace = true }
 solana-fee-structure = { workspace = true }
 solana-svm-transaction = { workspace = true }

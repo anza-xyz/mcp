@@ -14,6 +14,7 @@ use {
         voting_utils::{generate_vote_message, VoteError, VotingContext},
         votor::SharedContext,
     },
+    agave_feature_set as feature_set,
     crossbeam_channel::{select, RecvError, SendError},
     parking_lot::RwLock,
     solana_clock::Slot,
@@ -406,6 +407,7 @@ impl EventHandler {
             VotorEvent::Finalized(block, is_fast_finalization) => {
                 info!("{my_pubkey}: Finalized {block:?} fast: {is_fast_finalization}");
                 finalized_blocks.insert(block);
+                Self::maybe_record_empty_execution_output(block, ctx);
                 Self::check_rootable_blocks(
                     my_pubkey,
                     ctx,
@@ -521,6 +523,64 @@ impl EventHandler {
             local_context.my_pubkey
         );
         Some((parent_slot, parent_block_id))
+    }
+
+    fn maybe_record_empty_execution_output(finalized_block: Block, ctx: &SharedContext) {
+        let (slot, block_id) = finalized_block;
+        let bank_forks = ctx.bank_forks.read().unwrap();
+        if slot <= bank_forks.root() {
+            return;
+        }
+
+        // Check the slot bank first when available so feature activation is evaluated
+        // against the finalized slot instead of the current root.
+        if let Some(slot_bank) = bank_forks.get(slot) {
+            if !slot_bank
+                .feature_set
+                .is_active(&feature_set::mcp_protocol_v1::id())
+            {
+                return;
+            }
+            if slot_bank.block_id() == Some(block_id) {
+                return;
+            }
+            // A finalized block id mismatch indicates a fork/local replay mismatch,
+            // not an empty execution result.
+            debug!(
+                "Skipped empty MCP execution output for slot {}: finalized block id {} mismatches local bank {:?}",
+                slot,
+                block_id,
+                slot_bank.block_id()
+            );
+            return;
+        } else if !bank_forks
+            .root_bank()
+            .feature_set
+            .is_active(&feature_set::mcp_protocol_v1::id())
+        {
+            return;
+        }
+
+        drop(bank_forks);
+
+        match ctx
+            .blockstore
+            .put_mcp_empty_execution_output_if_absent(slot)
+        {
+            Ok(true) => {}
+            Ok(false) => {
+                debug!(
+                    "Skipped empty MCP execution output for slot {}: non-empty output already present",
+                    slot
+                );
+            }
+            Err(err) => {
+                warn!(
+                    "Failed to store empty MCP execution output for slot {}: {:?}",
+                    slot, err
+                );
+            }
+        }
     }
 
     fn handle_set_identity(
@@ -856,6 +916,10 @@ mod tests {
     }
 
     fn setup() -> EventHandlerTestContext {
+        setup_with_mcp_feature(true)
+    }
+
+    fn setup_with_mcp_feature(mcp_enabled: bool) -> EventHandlerTestContext {
         let (bls_sender, bls_receiver) = unbounded();
         let (commitment_sender, commitment_receiver) = unbounded();
         let (own_vote_sender, own_vote_receiver) = unbounded();
@@ -888,7 +952,12 @@ mod tests {
         let my_vote_keypair = validator_keypairs[my_index].vote_keypair.insecure_clone();
         let my_bls_keypair =
             BLSKeypair::derive_from_signer(&my_vote_keypair, BLS_KEYPAIR_DERIVE_SEED).unwrap();
-        let bank0 = Bank::new_for_tests(&genesis.genesis_config);
+        let mut bank0 = Bank::new_for_tests(&genesis.genesis_config);
+        if mcp_enabled {
+            bank0.activate_feature(&feature_set::mcp_protocol_v1::id());
+        } else {
+            bank0.deactivate_feature(&feature_set::mcp_protocol_v1::id());
+        }
         let bank_forks = BankForks::new_rw_arc(bank0);
         let contact_info = ContactInfo::new_localhost(&my_node_keypair.pubkey(), 0);
         let cluster_info = Arc::new(ClusterInfo::new(
@@ -1529,6 +1598,90 @@ mod tests {
         assert_eq!(dropped_banks[0].slot(), 0);
         // The bank forks root should be updated to 1
         assert_eq!(test_context.bank_forks.read().unwrap().root(), 1);
+    }
+
+    #[test]
+    fn test_records_empty_execution_output_for_missing_finalized_block() {
+        let test_context = setup();
+        let slot = 9;
+        EventHandler::maybe_record_empty_execution_output(
+            (slot, Hash::new_unique()),
+            &test_context.shared_context,
+        );
+        assert_eq!(
+            test_context
+                .shared_context
+                .blockstore
+                .get_mcp_execution_output(slot)
+                .unwrap(),
+            Some(vec![])
+        );
+    }
+
+    #[test]
+    fn test_skips_empty_execution_output_when_finalized_bank_exists() {
+        let mut test_context = setup();
+        let root_bank = test_context
+            .bank_forks
+            .read()
+            .unwrap()
+            .sharable_banks()
+            .root();
+        let bank = test_context.create_block_only(1, root_bank);
+        let block = (1, bank.block_id().unwrap());
+
+        EventHandler::maybe_record_empty_execution_output(block, &test_context.shared_context);
+        assert_eq!(
+            test_context
+                .shared_context
+                .blockstore
+                .get_mcp_execution_output(1)
+                .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn test_skips_empty_execution_output_when_finalized_block_id_mismatches_local_bank() {
+        let mut test_context = setup();
+        let root_bank = test_context
+            .bank_forks
+            .read()
+            .unwrap()
+            .sharable_banks()
+            .root();
+        test_context.create_block_only(1, root_bank);
+
+        EventHandler::maybe_record_empty_execution_output(
+            (1, Hash::new_unique()),
+            &test_context.shared_context,
+        );
+        assert_eq!(
+            test_context
+                .shared_context
+                .blockstore
+                .get_mcp_execution_output(1)
+                .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn test_skips_empty_execution_output_when_feature_inactive() {
+        let test_context = setup_with_mcp_feature(false);
+        let slot = 9;
+        EventHandler::maybe_record_empty_execution_output(
+            (slot, Hash::new_unique()),
+            &test_context.shared_context,
+        );
+        assert_eq!(
+            test_context
+                .shared_context
+                .blockstore
+                .get_mcp_execution_output(slot)
+                .unwrap(),
+            None
+        );
     }
 
     #[test]

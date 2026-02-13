@@ -174,6 +174,32 @@ pub mod columns {
     pub struct AlternateShredData;
 
     #[derive(Debug)]
+    /// The MCP shred data column
+    ///
+    /// Stores MCP shreds keyed by slot and MCP-scoped proposer/shred indices.
+    ///
+    /// * index type: `(slot: u64, proposer_index: u32, shred_index: u32)`
+    /// * value type: [`Vec<u8>`]
+    pub struct McpShredData;
+
+    #[derive(Debug)]
+    /// The MCP relay attestation column
+    ///
+    /// Stores RelayAttestation bytes keyed by slot and relay index.
+    ///
+    /// * index type: `(slot: u64, relay_index: u32)`
+    /// * value type: [`Vec<u8>`]
+    pub struct McpRelayAttestation;
+    /// The MCP execution output column.
+    ///
+    /// Stores ordered MCP execution output bytes for each slot. Empty output is
+    /// represented by an empty byte vector.
+    ///
+    /// * index type: `u64` (see [`SlotColumn`])
+    /// * value type: [`Vec<u8>`]
+    pub struct McpExecutionOutput;
+
+    #[derive(Debug)]
     /// The transaction status column
     ///
     /// * index type: `(`[`Signature`]`, `[`Slot`])`
@@ -770,6 +796,79 @@ impl Column for columns::AlternateShredData {
 }
 impl ColumnName for columns::AlternateShredData {
     const NAME: &'static str = "alt_data_shred";
+}
+
+impl Column for columns::McpShredData {
+    type Index = (
+        Slot,
+        /* proposer_index: */ u32,
+        /* shred_index: */ u32,
+    );
+    type Key = [u8; std::mem::size_of::<Slot>() + std::mem::size_of::<u32>() * 2];
+
+    #[inline]
+    fn key((slot, proposer_index, shred_index): &Self::Index) -> Self::Key {
+        convert_column_index_to_key_bytes!(Key,
+            ..8 => &slot.to_be_bytes(),
+            8..12 => &proposer_index.to_be_bytes(),
+            12..16 => &shred_index.to_be_bytes(),
+        )
+    }
+
+    fn index(key: &[u8]) -> Self::Index {
+        convert_column_key_bytes_to_index!(key,
+            0..8 => Slot::from_be_bytes,
+            8..12 => u32::from_be_bytes,  // proposer_index
+            12..16 => u32::from_be_bytes, // shred_index
+        )
+    }
+
+    fn slot(index: Self::Index) -> Slot {
+        index.0
+    }
+
+    fn as_index(slot: Slot) -> Self::Index {
+        (slot, 0, 0)
+    }
+}
+impl ColumnName for columns::McpShredData {
+    const NAME: &'static str = "mcp_shred_data";
+}
+
+impl Column for columns::McpRelayAttestation {
+    type Index = (Slot, /* relay_index: */ u32);
+    type Key = [u8; std::mem::size_of::<Slot>() + std::mem::size_of::<u32>()];
+
+    #[inline]
+    fn key((slot, relay_index): &Self::Index) -> Self::Key {
+        convert_column_index_to_key_bytes!(Key,
+            ..8 => &slot.to_be_bytes(),
+            8..12 => &relay_index.to_be_bytes(),
+        )
+    }
+
+    fn index(key: &[u8]) -> Self::Index {
+        convert_column_key_bytes_to_index!(key,
+            0..8 => Slot::from_be_bytes,
+            8..12 => u32::from_be_bytes,  // relay_index
+        )
+    }
+
+    fn slot(index: Self::Index) -> Slot {
+        index.0
+    }
+
+    fn as_index(slot: Slot) -> Self::Index {
+        (slot, 0)
+    }
+}
+impl ColumnName for columns::McpRelayAttestation {
+    const NAME: &'static str = "mcp_relay_attestation";
+}
+
+impl SlotColumn for columns::McpExecutionOutput {}
+impl ColumnName for columns::McpExecutionOutput {
+    const NAME: &'static str = "mcp_execution_output";
 }
 
 impl SlotColumn for columns::Index {}

@@ -20,6 +20,8 @@ use {
             VotedStakes, SWITCH_FORK_THRESHOLD,
         },
         cost_update_service::CostUpdate,
+        mcp_replay,
+        mcp_vote_gate::{self, VoteGateDecision, VoteGateInput},
         repair::{
             ancestor_hashes_service::AncestorHashesReplayUpdateSender,
             cluster_slot_state_verifier::*,
@@ -43,7 +45,7 @@ use {
     solana_entry::entry::VerifyRecyclers,
     solana_geyser_plugin_manager::block_metadata_notifier_interface::BlockMetadataNotifierArc,
     solana_gossip::cluster_info::ClusterInfo,
-    solana_hash::Hash,
+    solana_hash::{Hash, HASH_BYTES},
     solana_keypair::Keypair,
     solana_ledger::{
         block_error::BlockError,
@@ -56,6 +58,7 @@ use {
         entry_notifier_service::EntryNotifierSender,
         leader_schedule_cache::LeaderScheduleCache,
         leader_schedule_utils::first_of_consecutive_leader_slots,
+        mcp_consensus_block::ConsensusBlock,
     },
     solana_measure::measure::Measure,
     solana_poh::{
@@ -104,7 +107,7 @@ use {
         vote::Vote,
     },
     std::{
-        collections::{HashMap, HashSet},
+        collections::{BTreeMap, HashMap, HashSet},
         num::{NonZeroUsize, Saturating},
         result,
         sync::{
@@ -301,6 +304,10 @@ pub struct ReplayStageConfig {
     pub consensus_metrics_sender: ConsensusMetricsEventSender,
     pub consensus_metrics_receiver: ConsensusMetricsEventReceiver,
     pub migration_status: Arc<MigrationStatus>,
+    pub mcp_consensus_blocks: mcp_replay::McpConsensusBlockStore,
+    pub mcp_vote_gate_inputs: Arc<RwLock<HashMap<Slot, VoteGateInput>>>,
+    pub mcp_vote_gate_included_proposers:
+        Arc<RwLock<HashMap<Slot, BTreeMap<u32, mcp_vote_gate::Commitment>>>>,
     pub reward_votes_receiver: Receiver<AddVoteMessage>,
     pub reward_certs_sender: Sender<BuildRewardCertsResponse>,
     pub build_reward_certs_receiver: Receiver<BuildRewardCertsRequest>,
@@ -625,6 +632,9 @@ impl ReplayStage {
             consensus_metrics_sender,
             consensus_metrics_receiver,
             migration_status,
+            mcp_consensus_blocks,
+            mcp_vote_gate_inputs,
+            mcp_vote_gate_included_proposers,
             reward_votes_receiver,
             build_reward_certs_receiver,
             reward_certs_sender,
@@ -860,6 +870,10 @@ impl ReplayStage {
                     entry_notification_sender.as_ref(),
                     &verify_recyclers,
                     &replay_vote_sender,
+                    &leader_schedule_cache,
+                    &mcp_consensus_blocks,
+                    &mcp_vote_gate_inputs,
+                    &mcp_vote_gate_included_proposers,
                     &bank_notification_sender,
                     rpc_subscriptions.as_deref(),
                     &slot_status_notifier,
@@ -1133,6 +1147,16 @@ impl ReplayStage {
                     );
                     select_vote_and_reset_forks_time.stop();
 
+                    Self::maybe_process_pending_mcp_slots(
+                        &heaviest_bank,
+                        &mcp_consensus_blocks,
+                        &mcp_vote_gate_inputs,
+                        &mcp_vote_gate_included_proposers,
+                        &bank_forks,
+                        &blockstore,
+                        &leader_schedule_cache,
+                    );
+
                     if vote_bank.is_none() {
                         Self::maybe_refresh_last_vote(
                             &mut tower,
@@ -1181,6 +1205,9 @@ impl ReplayStage {
                         if let Err(e) = Self::handle_votable_bank(
                             vote_bank,
                             switch_fork_decision,
+                            &mcp_consensus_blocks,
+                            &mcp_vote_gate_inputs,
+                            &mcp_vote_gate_included_proposers,
                             &bank_forks,
                             &mut tower,
                             &mut progress,
@@ -2420,6 +2447,7 @@ impl ReplayStage {
         bank_forks: &RwLock<BankForks>,
         maybe_my_leader_slot: Slot,
         has_new_vote_been_rooted: bool,
+        allow_bankless_start: bool,
     ) -> bool {
         if bank_forks
             .read()
@@ -2440,7 +2468,7 @@ impl ReplayStage {
         if let Some(next_leader) =
             leader_schedule_cache.slot_leader_at(maybe_my_leader_slot, Some(parent_bank))
         {
-            if !has_new_vote_been_rooted {
+            if !has_new_vote_been_rooted && !allow_bankless_start {
                 info!("Haven't landed a vote, so skipping my leader slot");
                 return false;
             }
@@ -2595,6 +2623,16 @@ impl ReplayStage {
         };
 
         assert!(parent_bank.is_frozen());
+        let allow_bankless_start = migration_status.is_alpenglow_enabled()
+            && parent_bank
+                .feature_set
+                .activated_slot(&agave_feature_set::mcp_protocol_v1::id())
+                .is_some_and(|activated_slot| parent_bank.slot() >= activated_slot);
+
+        let allow_bankless_start = migration_status.is_alpenglow_enabled()
+            && parent_bank
+                .feature_set
+                .is_active(&agave_feature_set::mcp_protocol_v1::id());
 
         if !Self::common_maybe_start_leader_checks(
             my_pubkey,
@@ -2603,6 +2641,7 @@ impl ReplayStage {
             bank_forks,
             maybe_my_leader_slot,
             has_new_vote_been_rooted,
+            allow_bankless_start,
         ) {
             return None;
         }
@@ -2798,6 +2837,11 @@ impl ReplayStage {
     fn handle_votable_bank(
         bank: &Arc<Bank>,
         switch_fork_decision: &SwitchForkDecision,
+        mcp_consensus_blocks: &mcp_replay::McpConsensusBlockStore,
+        mcp_vote_gate_inputs: &RwLock<HashMap<Slot, VoteGateInput>>,
+        mcp_vote_gate_included_proposers: &RwLock<
+            HashMap<Slot, BTreeMap<u32, mcp_vote_gate::Commitment>>,
+        >,
         bank_forks: &Arc<RwLock<BankForks>>,
         tower: &mut Tower,
         progress: &mut ProgressMap,
@@ -2820,7 +2864,41 @@ impl ReplayStage {
         migration_status: &MigrationStatus,
         tbft_structs: &mut TowerBFTStructures,
     ) -> Result<(), SetRootError> {
-        assert!(!migration_status.is_alpenglow_enabled());
+        let mcp_vote_gate_enabled = bank
+            .feature_set
+            .activated_slot(&agave_feature_set::mcp_protocol_v1::id())
+            .is_some_and(|activated_slot| bank.slot() >= activated_slot);
+        if mcp_vote_gate_enabled {
+            mcp_replay::refresh_vote_gate_input(
+                bank.slot(),
+                bank,
+                bank_forks,
+                blockstore,
+                leader_schedule_cache,
+                mcp_consensus_blocks,
+                mcp_vote_gate_inputs,
+            );
+            if !Self::should_vote_mcp_slot(
+                bank.slot(),
+                mcp_vote_gate_inputs,
+                mcp_vote_gate_included_proposers,
+            ) {
+                return Ok(());
+            }
+            mcp_replay::maybe_persist_reconstructed_execution_output(
+                bank.slot(),
+                bank,
+                bank_forks,
+                blockstore,
+                leader_schedule_cache,
+                mcp_vote_gate_included_proposers,
+            );
+        } else {
+            // Preserve pre-MCP behavior: Alpenglow migration should not progress through
+            // ReplayStage vote handling unless MCP vote gating is explicitly enabled.
+            assert!(!migration_status.is_alpenglow_enabled());
+        }
+
         if bank.is_empty() {
             datapoint_info!("replay_stage-voted_empty_bank", ("slot", bank.slot(), i64));
         }
@@ -2915,6 +2993,204 @@ impl ReplayStage {
             wait_to_vote_slot,
         );
         Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn maybe_process_pending_mcp_slots(
+        heaviest_bank: &Arc<Bank>,
+        mcp_consensus_blocks: &mcp_replay::McpConsensusBlockStore,
+        mcp_vote_gate_inputs: &RwLock<HashMap<Slot, VoteGateInput>>,
+        mcp_vote_gate_included_proposers: &RwLock<
+            HashMap<Slot, BTreeMap<u32, mcp_vote_gate::Commitment>>,
+        >,
+        bank_forks: &Arc<RwLock<BankForks>>,
+        blockstore: &Blockstore,
+        leader_schedule_cache: &Arc<LeaderScheduleCache>,
+    ) {
+        if !heaviest_bank
+            .feature_set
+            .activated_slot(&agave_feature_set::mcp_protocol_v1::id())
+            .is_some_and(|activated_slot| heaviest_bank.slot() >= activated_slot)
+        {
+            return;
+        }
+
+        const MCP_PENDING_PROCESS_PER_LOOP: usize = 16;
+
+        let mut pending_slots = match mcp_consensus_blocks.read() {
+            Ok(consensus_blocks) => consensus_blocks.keys().copied().collect::<Vec<_>>(),
+            Err(err) => {
+                warn!(
+                    "failed to read MCP consensus block cache while processing pending slots: {}",
+                    err
+                );
+                return;
+            }
+        };
+        if pending_slots.is_empty() {
+            return;
+        }
+        pending_slots.sort_unstable();
+
+        let heaviest_slot = heaviest_bank.slot();
+        let pending_slot_banks = {
+            let bank_forks = bank_forks.read().unwrap();
+            let root_slot = bank_forks.root();
+            pending_slots
+                .into_iter()
+                .filter(|slot| *slot >= root_slot && *slot <= heaviest_slot)
+                .map(|slot| (slot, bank_forks.get(slot)))
+                .collect::<Vec<_>>()
+        };
+        let start = pending_slot_banks
+            .len()
+            .saturating_sub(MCP_PENDING_PROCESS_PER_LOOP);
+        if start < pending_slot_banks.len() {
+            debug!(
+                "processing {} pending MCP consensus slots (heaviest={}, window={})",
+                pending_slot_banks.len(),
+                heaviest_slot,
+                MCP_PENDING_PROCESS_PER_LOOP
+            );
+        }
+        for (slot, slot_bank) in pending_slot_banks.into_iter().skip(start) {
+            if blockstore
+                .get_mcp_execution_output(slot)
+                .ok()
+                .flatten()
+                .is_some_and(|output| !output.is_empty())
+            {
+                continue;
+            }
+
+            let Some(slot_bank) = slot_bank else {
+                debug!(
+                    "skipping pending MCP consensus slot {} this pass: slot bank unavailable",
+                    slot
+                );
+                continue;
+            };
+            mcp_replay::refresh_vote_gate_input(
+                slot,
+                slot_bank.as_ref(),
+                bank_forks,
+                blockstore,
+                leader_schedule_cache,
+                mcp_consensus_blocks,
+                mcp_vote_gate_inputs,
+            );
+            if !Self::should_vote_mcp_slot(
+                slot,
+                mcp_vote_gate_inputs,
+                mcp_vote_gate_included_proposers,
+            ) {
+                continue;
+            }
+            debug!(
+                "MCP vote gate passed while processing pending slot {} in replay loop",
+                slot
+            );
+            mcp_replay::maybe_persist_reconstructed_execution_output(
+                slot,
+                slot_bank.as_ref(),
+                bank_forks,
+                blockstore,
+                leader_schedule_cache,
+                mcp_vote_gate_included_proposers,
+            );
+        }
+    }
+
+    fn should_vote_mcp_slot(
+        slot: Slot,
+        mcp_vote_gate_inputs: &RwLock<HashMap<Slot, VoteGateInput>>,
+        mcp_vote_gate_included_proposers: &RwLock<
+            HashMap<Slot, BTreeMap<u32, mcp_vote_gate::Commitment>>,
+        >,
+    ) -> bool {
+        const MCP_VOTE_GATE_INPUT_RETENTION_SLOTS: Slot = 512;
+        const MCP_VOTE_GATE_PRUNE_PERIOD_SLOTS: Slot = 64;
+
+        let decision = match mcp_vote_gate_inputs.read() {
+            Ok(inputs) => {
+                let Some(input) = inputs.get(&slot) else {
+                    debug!(
+                        "MCP vote gate missing input for slot {}; rejecting vote",
+                        slot
+                    );
+                    return false;
+                };
+                let decision = mcp_vote_gate::evaluate_vote_gate(input);
+                trace!("MCP vote gate decision at slot {}: {:?}", slot, decision);
+                decision
+            }
+            Err(err) => {
+                warn!(
+                    "MCP vote gate lock poisoned while evaluating slot {}: {}; rejecting vote",
+                    slot, err
+                );
+                return false;
+            }
+        };
+
+        if slot % MCP_VOTE_GATE_PRUNE_PERIOD_SLOTS == 0 {
+            let min_slot = slot.saturating_sub(MCP_VOTE_GATE_INPUT_RETENTION_SLOTS);
+            match mcp_vote_gate_inputs.write() {
+                Ok(mut inputs) => {
+                    inputs.retain(|tracked_slot, _| *tracked_slot >= min_slot);
+                }
+                Err(err) => {
+                    warn!(
+                        "MCP vote gate input lock poisoned while pruning at slot {}: {}",
+                        slot, err
+                    );
+                }
+            }
+            match mcp_vote_gate_included_proposers.write() {
+                Ok(mut included_proposers) => {
+                    included_proposers.retain(|tracked_slot, _| *tracked_slot >= min_slot);
+                }
+                Err(err) => {
+                    warn!(
+                        "MCP vote gate proposer-output lock poisoned while pruning at slot {}: {}",
+                        slot, err
+                    );
+                }
+            }
+        }
+
+        match decision {
+            VoteGateDecision::Vote { included_proposers } => {
+                match mcp_vote_gate_included_proposers.write() {
+                    Ok(mut output) => {
+                        output.insert(slot, included_proposers);
+                    }
+                    Err(err) => {
+                        warn!(
+                            "MCP vote gate proposer-output lock poisoned for slot {}: {}; rejecting vote",
+                            slot, err
+                        );
+                        return false;
+                    }
+                }
+                true
+            }
+            VoteGateDecision::Reject(reason) => {
+                match mcp_vote_gate_included_proposers.write() {
+                    Ok(mut output) => {
+                        output.remove(&slot);
+                    }
+                    Err(err) => {
+                        warn!(
+                            "MCP vote gate proposer-output lock poisoned while rejecting slot {}: {}",
+                            slot, err
+                        );
+                    }
+                }
+                info!("MCP vote gate rejected slot {}: {}", slot, reason);
+                false
+            }
+        }
     }
 
     fn generate_vote_tx(
@@ -3299,6 +3575,106 @@ impl ReplayStage {
         );
     }
 
+    /// Ensure vote-gated MCP slots have reconstructed execution output available
+    /// before replaying entries. If output is not ready yet, replay is deferred.
+    fn has_mcp_consensus_block_for_slot(
+        slot: Slot,
+        mcp_consensus_blocks: &mcp_replay::McpConsensusBlockStore,
+    ) -> bool {
+        match mcp_consensus_blocks.read() {
+            Ok(consensus_blocks) => consensus_blocks.contains_key(&slot),
+            Err(err) => {
+                warn!(
+                    "failed to read MCP consensus block cache for slot {}: {}",
+                    slot, err
+                );
+                false
+            }
+        }
+    }
+
+    fn maybe_prepare_mcp_execution_output_for_replay_slot(
+        bank: &Bank,
+        blockstore: &Blockstore,
+        bank_forks: &RwLock<BankForks>,
+        leader_schedule_cache: &LeaderScheduleCache,
+        mcp_consensus_blocks: &mcp_replay::McpConsensusBlockStore,
+        mcp_vote_gate_inputs: &RwLock<HashMap<Slot, VoteGateInput>>,
+        mcp_vote_gate_included_proposers: &RwLock<
+            HashMap<Slot, BTreeMap<u32, mcp_vote_gate::Commitment>>,
+        >,
+    ) -> bool {
+        let Some(activated_slot) = bank
+            .feature_set
+            .activated_slot(&agave_feature_set::mcp_protocol_v1::id())
+        else {
+            return true;
+        };
+        if bank.slot() < activated_slot {
+            return true;
+        }
+
+        let existing_output = blockstore
+            .get_mcp_execution_output(bank.slot())
+            .ok()
+            .flatten();
+        if existing_output
+            .as_ref()
+            .is_some_and(|output| !output.is_empty())
+        {
+            return true;
+        }
+        if !Self::has_mcp_consensus_block_for_slot(bank.slot(), mcp_consensus_blocks) {
+            let _ = blockstore.put_mcp_empty_execution_output_if_absent(bank.slot());
+            return true;
+        }
+
+        mcp_replay::refresh_vote_gate_input(
+            bank.slot(),
+            bank,
+            bank_forks,
+            blockstore,
+            leader_schedule_cache,
+            mcp_consensus_blocks,
+            mcp_vote_gate_inputs,
+        );
+        if !Self::should_vote_mcp_slot(
+            bank.slot(),
+            mcp_vote_gate_inputs,
+            mcp_vote_gate_included_proposers,
+        ) {
+            debug!(
+                "deferring replay for slot {}: consensus block observed but vote gate not satisfied",
+                bank.slot()
+            );
+            return false;
+        }
+
+        mcp_replay::maybe_persist_reconstructed_execution_output(
+            bank.slot(),
+            bank,
+            bank_forks,
+            blockstore,
+            leader_schedule_cache,
+            mcp_vote_gate_included_proposers,
+        );
+
+        if blockstore
+            .get_mcp_execution_output(bank.slot())
+            .ok()
+            .flatten()
+            .is_some_and(|output| !output.is_empty())
+        {
+            return true;
+        }
+
+        debug!(
+            "deferring replay for slot {}: MCP execution output is unavailable",
+            bank.slot()
+        );
+        false
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn replay_active_banks_concurrently(
         blockstore: &Blockstore,
@@ -3307,6 +3683,12 @@ impl ReplayStage {
         replay_tx_thread_pool: &ThreadPool,
         my_pubkey: &Pubkey,
         vote_account: &Pubkey,
+        leader_schedule_cache: &LeaderScheduleCache,
+        mcp_consensus_blocks: &mcp_replay::McpConsensusBlockStore,
+        mcp_vote_gate_inputs: &RwLock<HashMap<Slot, VoteGateInput>>,
+        mcp_vote_gate_included_proposers: &RwLock<
+            HashMap<Slot, BTreeMap<u32, mcp_vote_gate::Commitment>>,
+        >,
         progress: &mut ProgressMap,
         transaction_status_sender: Option<&TransactionStatusSender>,
         entry_notification_sender: Option<&EntryNotifierSender>,
@@ -3385,6 +3767,17 @@ impl ReplayStage {
                     drop(progress_lock);
 
                     if bank.collector_id() != my_pubkey {
+                        if !Self::maybe_prepare_mcp_execution_output_for_replay_slot(
+                            bank.as_ref(),
+                            blockstore,
+                            bank_forks,
+                            leader_schedule_cache,
+                            mcp_consensus_blocks,
+                            mcp_vote_gate_inputs,
+                            mcp_vote_gate_included_proposers,
+                        ) {
+                            return replay_result;
+                        }
                         let mut replay_blockstore_time =
                             Measure::start("replay_blockstore_into_bank");
                         let blockstore_result = Self::replay_blockstore_into_bank(
@@ -3424,6 +3817,12 @@ impl ReplayStage {
         replay_tx_thread_pool: &ThreadPool,
         my_pubkey: &Pubkey,
         vote_account: &Pubkey,
+        leader_schedule_cache: &LeaderScheduleCache,
+        mcp_consensus_blocks: &mcp_replay::McpConsensusBlockStore,
+        mcp_vote_gate_inputs: &RwLock<HashMap<Slot, VoteGateInput>>,
+        mcp_vote_gate_included_proposers: &RwLock<
+            HashMap<Slot, BTreeMap<u32, mcp_vote_gate::Commitment>>,
+        >,
         progress: &mut ProgressMap,
         transaction_status_sender: Option<&TransactionStatusSender>,
         entry_notification_sender: Option<&EntryNotifierSender>,
@@ -3477,6 +3876,17 @@ impl ReplayStage {
             });
 
             if bank.collector_id() != my_pubkey {
+                if !Self::maybe_prepare_mcp_execution_output_for_replay_slot(
+                    bank.as_ref(),
+                    blockstore,
+                    bank_forks,
+                    leader_schedule_cache,
+                    mcp_consensus_blocks,
+                    mcp_vote_gate_inputs,
+                    mcp_vote_gate_included_proposers,
+                ) {
+                    return replay_result;
+                }
                 let mut replay_blockstore_time = Measure::start("replay_blockstore_into_bank");
                 let blockstore_result = Self::replay_blockstore_into_bank(
                     &bank,
@@ -3550,12 +3960,41 @@ impl ReplayStage {
 
     /// Computes and sets the block ID for a bank based on migration status and block validity.
     /// Returns Ok(()) if the block ID was successfully computed and set, or Err(error) if the slot should be marked dead.
+    fn mcp_authoritative_block_id_for_slot(
+        slot: Slot,
+        mcp_consensus_blocks: &mcp_replay::McpConsensusBlockStore,
+    ) -> Option<Hash> {
+        let payload = match mcp_consensus_blocks.read() {
+            Ok(blocks) => blocks.get(&slot).cloned(),
+            Err(err) => {
+                warn!(
+                    "failed to read MCP consensus block cache while deriving block_id for slot {}: {}",
+                    slot, err
+                );
+                None
+            }
+        }?;
+        let consensus_block = ConsensusBlock::from_wire_bytes(&payload).ok()?;
+        if consensus_block.slot != slot || consensus_block.consensus_meta.len() != HASH_BYTES {
+            return None;
+        }
+        let mut block_id = [0u8; HASH_BYTES];
+        block_id.copy_from_slice(&consensus_block.consensus_meta[..HASH_BYTES]);
+        Some(Hash::new_from_array(block_id))
+    }
+
     fn determine_and_set_block_id(
         bank: &BankWithScheduler,
         blockstore: &Blockstore,
         migration_status: &MigrationStatus,
         is_leader_block: bool,
+        authoritative_mcp_block_id: Option<Hash>,
     ) -> Result<(), BlockstoreProcessorError> {
+        if let Some(block_id) = authoritative_mcp_block_id {
+            bank.set_block_id(Some(block_id));
+            return Ok(());
+        }
+
         let block_id = if migration_status.should_use_double_merkle_block_id(bank.slot()) {
             let block_id = blockstore.get_double_merkle_root(bank.slot(), BlockLocation::Original);
             // The *only* reason this can be none is because we are the leader.
@@ -3593,6 +4032,18 @@ impl ReplayStage {
         Ok(())
     }
 
+    fn should_defer_for_missing_mcp_authoritative_block_id(
+        bank: &Bank,
+        mcp_consensus_blocks: &mcp_replay::McpConsensusBlockStore,
+    ) -> bool {
+        bank.feature_set
+            .activated_slot(&agave_feature_set::mcp_protocol_v1::id())
+            .is_some_and(|activated_slot| bank.slot() >= activated_slot)
+            && Self::has_mcp_consensus_block_for_slot(bank.slot(), mcp_consensus_blocks)
+            && Self::mcp_authoritative_block_id_for_slot(bank.slot(), mcp_consensus_blocks)
+                .is_none()
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn process_replay_results(
         blockstore: &Blockstore,
@@ -3613,6 +4064,7 @@ impl ReplayStage {
         my_pubkey: &Pubkey,
         mut tbft_structs: Option<&mut TowerBFTStructures>,
         migration_status: &MigrationStatus,
+        mcp_consensus_blocks: &mcp_replay::McpConsensusBlockStore,
         votor_event_sender: &VotorEventSender,
     ) -> Vec<Slot> {
         // TODO: See if processing of blockstore replay results and bank completion can be made thread safe.
@@ -3699,11 +4151,29 @@ impl ReplayStage {
                 }
 
                 let is_leader_block = bank.collector_id() == my_pubkey;
+                let authoritative_mcp_block_id = bank
+                    .feature_set
+                    .activated_slot(&agave_feature_set::mcp_protocol_v1::id())
+                    .filter(|activated_slot| bank.slot() >= *activated_slot)
+                    .and_then(|_| {
+                        Self::mcp_authoritative_block_id_for_slot(bank.slot(), mcp_consensus_blocks)
+                    });
+                if Self::should_defer_for_missing_mcp_authoritative_block_id(
+                    bank.as_ref(),
+                    mcp_consensus_blocks,
+                ) {
+                    debug!(
+                        "deferring completion for slot {}: missing authoritative MCP block_id sidecar",
+                        bank.slot()
+                    );
+                    continue;
+                }
                 if let Err(result_err) = Self::determine_and_set_block_id(
                     bank,
                     blockstore,
                     migration_status,
                     is_leader_block,
+                    authoritative_mcp_block_id,
                 ) {
                     // Once SIMD-0317 is activated, this can be removed as block_id computation can no longer fail
                     let root = bank_forks.read().unwrap().root();
@@ -3743,6 +4213,8 @@ impl ReplayStage {
                     ("slot", bank_slot, i64),
                     ("hash", bank.hash().to_string(), String),
                 );
+                // Persist frozen bank hashes for MCP delayed-bankhash verification.
+                blockstore.insert_bank_hash(bank_slot, bank.hash(), false);
 
                 if let Some(transaction_status_sender) = transaction_status_sender {
                     transaction_status_sender.send_transaction_status_freeze_message(bank);
@@ -3921,6 +4393,12 @@ impl ReplayStage {
         entry_notification_sender: Option<&EntryNotifierSender>,
         verify_recyclers: &VerifyRecyclers,
         replay_vote_sender: &ReplayVoteSender,
+        leader_schedule_cache: &LeaderScheduleCache,
+        mcp_consensus_blocks: &mcp_replay::McpConsensusBlockStore,
+        mcp_vote_gate_inputs: &RwLock<HashMap<Slot, VoteGateInput>>,
+        mcp_vote_gate_included_proposers: &RwLock<
+            HashMap<Slot, BTreeMap<u32, mcp_vote_gate::Commitment>>,
+        >,
         bank_notification_sender: &Option<BankNotificationSenderConfig>,
         rpc_subscriptions: Option<&RpcSubscriptions>,
         slot_status_notifier: &Option<SlotStatusNotifier>,
@@ -3957,6 +4435,10 @@ impl ReplayStage {
                     replay_tx_thread_pool,
                     my_pubkey,
                     vote_account,
+                    leader_schedule_cache,
+                    mcp_consensus_blocks,
+                    mcp_vote_gate_inputs,
+                    mcp_vote_gate_included_proposers,
                     progress,
                     transaction_status_sender,
                     entry_notification_sender,
@@ -3978,6 +4460,10 @@ impl ReplayStage {
                         replay_tx_thread_pool,
                         my_pubkey,
                         vote_account,
+                        leader_schedule_cache,
+                        mcp_consensus_blocks,
+                        mcp_vote_gate_inputs,
+                        mcp_vote_gate_included_proposers,
                         progress,
                         transaction_status_sender,
                         entry_notification_sender,
@@ -4012,6 +4498,7 @@ impl ReplayStage {
             my_pubkey,
             tbft_structs,
             migration_status,
+            mcp_consensus_blocks,
             votor_event_sender,
         )
     }
@@ -4939,6 +5426,8 @@ pub(crate) mod tests {
             create_new_tmp_ledger,
             genesis_utils::{create_genesis_config, create_genesis_config_with_leader},
             get_tmp_ledger_path, get_tmp_ledger_path_auto_delete,
+            mcp_aggregate_attestation::AggregateAttestation,
+            mcp_consensus_block::ConsensusBlock,
             shred::{ProcessShredsStats, ReedSolomonCache, Shred, Shredder},
         },
         solana_poh::poh_recorder::create_test_recorder,
@@ -4983,6 +5472,327 @@ pub(crate) mod tests {
             .unwrap()
             .insert(bank)
             .clone_without_scheduler()
+    }
+
+    fn make_mcp_vote_gate_input(delayed_bankhash_available: bool) -> VoteGateInput {
+        let commitment = [7u8; 32];
+        let aggregate = (0..mcp_vote_gate::REQUIRED_ATTESTATIONS)
+            .map(|relay_index| mcp_vote_gate::RelayAttestationObservation {
+                relay_index: relay_index as u32,
+                relay_signature_valid: true,
+                entries: vec![mcp_vote_gate::RelayProposerEntry {
+                    proposer_index: 0,
+                    commitment,
+                    proposer_signature_valid: true,
+                }],
+            })
+            .collect();
+
+        VoteGateInput {
+            leader_signature_valid: true,
+            leader_index_matches: true,
+            delayed_bankhash_available,
+            delayed_bankhash_matches: true,
+            aggregate,
+            proposer_indices: vec![0],
+            local_valid_shreds: HashMap::from([(0, mcp_vote_gate::REQUIRED_RECONSTRUCTION)]),
+        }
+    }
+
+    #[test]
+    fn test_should_vote_mcp_slot_rejects_missing_input() {
+        let mcp_vote_gate_inputs = RwLock::new(HashMap::new());
+        let mcp_vote_gate_included_proposers = RwLock::new(HashMap::new());
+        assert!(!ReplayStage::should_vote_mcp_slot(
+            9,
+            &mcp_vote_gate_inputs,
+            &mcp_vote_gate_included_proposers,
+        ));
+    }
+
+    #[test]
+    fn test_should_vote_mcp_slot_rejects_missing_delayed_bankhash() {
+        let mcp_vote_gate_inputs =
+            RwLock::new(HashMap::from([(11, make_mcp_vote_gate_input(false))]));
+        let mcp_vote_gate_included_proposers = RwLock::new(HashMap::new());
+        assert!(!ReplayStage::should_vote_mcp_slot(
+            11,
+            &mcp_vote_gate_inputs,
+            &mcp_vote_gate_included_proposers,
+        ));
+    }
+
+    #[test]
+    fn test_should_vote_mcp_slot_accepts_valid_gate_input() {
+        let mcp_vote_gate_inputs =
+            RwLock::new(HashMap::from([(13, make_mcp_vote_gate_input(true))]));
+        let mcp_vote_gate_included_proposers = RwLock::new(HashMap::new());
+        assert!(ReplayStage::should_vote_mcp_slot(
+            13,
+            &mcp_vote_gate_inputs,
+            &mcp_vote_gate_included_proposers,
+        ));
+        assert!(mcp_vote_gate_included_proposers
+            .read()
+            .unwrap()
+            .contains_key(&13));
+    }
+
+    #[test]
+    fn test_should_vote_mcp_slot_reuses_input_for_slot() {
+        let mcp_vote_gate_inputs =
+            RwLock::new(HashMap::from([(15, make_mcp_vote_gate_input(true))]));
+        let mcp_vote_gate_included_proposers = RwLock::new(HashMap::new());
+        assert!(ReplayStage::should_vote_mcp_slot(
+            15,
+            &mcp_vote_gate_inputs,
+            &mcp_vote_gate_included_proposers,
+        ));
+        assert!(ReplayStage::should_vote_mcp_slot(
+            15,
+            &mcp_vote_gate_inputs,
+            &mcp_vote_gate_included_proposers,
+        ));
+    }
+
+    #[test]
+    fn test_mcp_authoritative_block_id_for_slot_reads_hash_sized_consensus_meta() {
+        let slot = 21;
+        let leader = Keypair::new();
+        let block_id = Hash::new_unique();
+        let aggregate_bytes = AggregateAttestation::new_canonical(slot, 0, vec![])
+            .unwrap()
+            .to_wire_bytes()
+            .unwrap();
+        let mut consensus_block = ConsensusBlock::new_unsigned(
+            slot,
+            0,
+            aggregate_bytes,
+            block_id.to_bytes().to_vec(),
+            Hash::new_unique(),
+        )
+        .unwrap();
+        consensus_block.sign_leader(&leader).unwrap();
+
+        let store = Arc::new(RwLock::new(HashMap::new()));
+        store
+            .write()
+            .unwrap()
+            .insert(slot, consensus_block.to_wire_bytes().unwrap());
+
+        assert_eq!(
+            ReplayStage::mcp_authoritative_block_id_for_slot(slot, &store),
+            Some(block_id)
+        );
+    }
+
+    #[test]
+    fn test_mcp_authoritative_block_id_for_slot_rejects_non_hash_sized_consensus_meta() {
+        let slot = 22;
+        let leader = Keypair::new();
+        let aggregate_bytes = AggregateAttestation::new_canonical(slot, 0, vec![])
+            .unwrap()
+            .to_wire_bytes()
+            .unwrap();
+        let mut consensus_block = ConsensusBlock::new_unsigned(
+            slot,
+            0,
+            aggregate_bytes,
+            vec![9u8; HASH_BYTES - 1],
+            Hash::new_unique(),
+        )
+        .unwrap();
+        consensus_block.sign_leader(&leader).unwrap();
+
+        let store = Arc::new(RwLock::new(HashMap::new()));
+        store
+            .write()
+            .unwrap()
+            .insert(slot, consensus_block.to_wire_bytes().unwrap());
+
+        assert_eq!(
+            ReplayStage::mcp_authoritative_block_id_for_slot(slot, &store),
+            None
+        );
+    }
+
+    #[test]
+    fn test_should_defer_for_missing_mcp_authoritative_block_id_for_active_mcp_slot() {
+        let ledger_path = get_tmp_ledger_path_auto_delete!();
+        let _blockstore = Blockstore::open(ledger_path.path()).unwrap();
+        let leader = Keypair::new();
+        let mut genesis = create_genesis_config_with_leader(10_000, &leader.pubkey(), 1_000);
+        genesis
+            .genesis_config
+            .accounts
+            .remove(&agave_feature_set::mcp_protocol_v1::id());
+        let mut root_bank = Bank::new_for_tests(&genesis.genesis_config);
+        root_bank.activate_feature(&agave_feature_set::mcp_protocol_v1::id());
+        let bank_forks = BankForks::new_rw_arc(root_bank);
+        let root_bank = bank_forks.read().unwrap().root_bank();
+        let replay_bank = bank_forks
+            .write()
+            .unwrap()
+            .insert(Bank::new_from_parent(root_bank, &leader.pubkey(), 1))
+            .clone_without_scheduler();
+
+        let mcp_consensus_blocks = Arc::new(RwLock::new(HashMap::new()));
+        assert!(
+            !ReplayStage::should_defer_for_missing_mcp_authoritative_block_id(
+                replay_bank.as_ref(),
+                &mcp_consensus_blocks,
+            )
+        );
+
+        let aggregate_bytes = AggregateAttestation::new_canonical(1, 0, vec![])
+            .unwrap()
+            .to_wire_bytes()
+            .unwrap();
+        let mut invalid_consensus_block = ConsensusBlock::new_unsigned(
+            1,
+            0,
+            aggregate_bytes.clone(),
+            vec![7u8; HASH_BYTES - 1],
+            Hash::new_unique(),
+        )
+        .unwrap();
+        invalid_consensus_block.sign_leader(&leader).unwrap();
+        mcp_consensus_blocks
+            .write()
+            .unwrap()
+            .insert(1, invalid_consensus_block.to_wire_bytes().unwrap());
+
+        assert!(
+            ReplayStage::should_defer_for_missing_mcp_authoritative_block_id(
+                replay_bank.as_ref(),
+                &mcp_consensus_blocks,
+            )
+        );
+
+        let block_id = Hash::new_unique();
+        let mut consensus_block = ConsensusBlock::new_unsigned(
+            1,
+            0,
+            aggregate_bytes,
+            block_id.to_bytes().to_vec(),
+            Hash::new_unique(),
+        )
+        .unwrap();
+        consensus_block.sign_leader(&leader).unwrap();
+        mcp_consensus_blocks
+            .write()
+            .unwrap()
+            .insert(1, consensus_block.to_wire_bytes().unwrap());
+
+        assert!(
+            !ReplayStage::should_defer_for_missing_mcp_authoritative_block_id(
+                replay_bank.as_ref(),
+                &mcp_consensus_blocks,
+            )
+        );
+    }
+
+    #[test]
+    fn test_should_not_defer_for_missing_mcp_authoritative_block_id_before_feature_activation() {
+        let leader = Keypair::new();
+        let mut genesis = create_genesis_config_with_leader(10_000, &leader.pubkey(), 1_000);
+        genesis
+            .genesis_config
+            .accounts
+            .remove(&agave_feature_set::mcp_protocol_v1::id());
+        let root_bank = Bank::new_for_tests(&genesis.genesis_config);
+        let bank_forks = BankForks::new_rw_arc(root_bank);
+        let root_bank = bank_forks.read().unwrap().root_bank();
+        let replay_bank = bank_forks
+            .write()
+            .unwrap()
+            .insert(Bank::new_from_parent(root_bank, &leader.pubkey(), 1))
+            .clone_without_scheduler();
+
+        let mcp_consensus_blocks = Arc::new(RwLock::new(HashMap::new()));
+        assert!(
+            !ReplayStage::should_defer_for_missing_mcp_authoritative_block_id(
+                replay_bank.as_ref(),
+                &mcp_consensus_blocks,
+            )
+        );
+    }
+
+    #[test]
+    fn test_maybe_prepare_mcp_execution_output_for_replay_slot_writes_empty_placeholder_without_consensus(
+    ) {
+        let ledger_path = get_tmp_ledger_path_auto_delete!();
+        let blockstore = Blockstore::open(ledger_path.path()).unwrap();
+        let leader = Keypair::new();
+        let mut genesis = create_genesis_config_with_leader(10_000, &leader.pubkey(), 1_000);
+        genesis
+            .genesis_config
+            .accounts
+            .remove(&agave_feature_set::mcp_protocol_v1::id());
+        let mut root_bank = Bank::new_for_tests(&genesis.genesis_config);
+        root_bank.activate_feature(&agave_feature_set::mcp_protocol_v1::id());
+        let bank_forks = BankForks::new_rw_arc(root_bank);
+        let root_bank = bank_forks.read().unwrap().root_bank();
+        let replay_bank = bank_forks
+            .write()
+            .unwrap()
+            .insert(Bank::new_from_parent(root_bank, &leader.pubkey(), 1))
+            .clone_without_scheduler();
+        let leader_schedule_cache = LeaderScheduleCache::new_from_bank(&replay_bank);
+        let mcp_consensus_blocks = Arc::new(RwLock::new(HashMap::new()));
+        let mcp_vote_gate_inputs = RwLock::new(HashMap::new());
+        let mcp_vote_gate_included_proposers = RwLock::new(HashMap::new());
+
+        assert!(
+            ReplayStage::maybe_prepare_mcp_execution_output_for_replay_slot(
+                replay_bank.as_ref(),
+                &blockstore,
+                &bank_forks,
+                &leader_schedule_cache,
+                &mcp_consensus_blocks,
+                &mcp_vote_gate_inputs,
+                &mcp_vote_gate_included_proposers,
+            )
+        );
+        assert_eq!(
+            blockstore.get_mcp_execution_output(1).unwrap(),
+            Some(vec![])
+        );
+    }
+
+    #[test]
+    fn test_common_maybe_start_leader_checks_allows_mcp_bankless_start_without_rooted_vote() {
+        let (VoteSimulator { bank_forks, .. }, _blockstore) =
+            setup_default_forks(1, None::<GenerateVotes>);
+        let parent_bank = bank_forks.read().unwrap().working_bank();
+        let leader_schedule_cache = Arc::new(LeaderScheduleCache::new_from_bank(&parent_bank));
+        let my_pubkey = leader_schedule_cache
+            .slot_leader_at(parent_bank.slot().saturating_add(1), Some(&parent_bank))
+            .expect("leader must exist");
+        let maybe_my_leader_slot = ((parent_bank.slot() + 1)..=(parent_bank.slot() + 2048))
+            .find(|slot| {
+                leader_schedule_cache.slot_leader_at(*slot, Some(&parent_bank)) == Some(my_pubkey)
+            })
+            .expect("a leader slot should exist for the local validator");
+
+        assert!(!ReplayStage::common_maybe_start_leader_checks(
+            &my_pubkey,
+            &leader_schedule_cache,
+            &parent_bank,
+            bank_forks.as_ref(),
+            maybe_my_leader_slot,
+            false,
+            false,
+        ));
+        assert!(ReplayStage::common_maybe_start_leader_checks(
+            &my_pubkey,
+            &leader_schedule_cache,
+            &parent_bank,
+            bank_forks.as_ref(),
+            maybe_my_leader_slot,
+            false,
+            true,
+        ));
     }
 
     #[test]
@@ -9877,6 +10687,43 @@ pub(crate) mod tests {
         assert!(!fork_choice
             .is_candidate(&(5, bank_forks.bank_hash(5).unwrap()))
             .unwrap());
+    }
+
+    #[test]
+    fn test_common_maybe_start_leader_checks_allows_mcp_bankless_start_without_rooted_vote() {
+        let ReplayBlockstoreComponents {
+            my_pubkey,
+            leader_schedule_cache,
+            vote_simulator,
+            ..
+        } = replay_blockstore_components(None, 1, None::<GenerateVotes>);
+        let VoteSimulator { bank_forks, .. } = vote_simulator;
+
+        let parent_bank = bank_forks.read().unwrap().working_bank();
+        let maybe_my_leader_slot = ((parent_bank.slot() + 1)..=(parent_bank.slot() + 2048))
+            .find(|slot| {
+                leader_schedule_cache.slot_leader_at(*slot, Some(&parent_bank)) == Some(my_pubkey)
+            })
+            .expect("a leader slot should exist for the local validator");
+
+        assert!(!ReplayStage::common_maybe_start_leader_checks(
+            &my_pubkey,
+            &leader_schedule_cache,
+            &parent_bank,
+            bank_forks.as_ref(),
+            maybe_my_leader_slot,
+            false,
+            false,
+        ));
+        assert!(ReplayStage::common_maybe_start_leader_checks(
+            &my_pubkey,
+            &leader_schedule_cache,
+            &parent_bank,
+            bank_forks.as_ref(),
+            maybe_my_leader_slot,
+            false,
+            true,
+        ));
     }
 
     #[test]

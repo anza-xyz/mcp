@@ -1,12 +1,12 @@
 use {
     super::{Bank, BankStatusCache},
-    agave_feature_set::{raise_cpi_nesting_limit_to_8, FeatureSet},
+    agave_feature_set::{mcp_protocol_v1, raise_cpi_nesting_limit_to_8, FeatureSet},
     solana_account::{state_traits::StateMut, AccountSharedData},
     solana_accounts_db::blockhash_queue::BlockhashQueue,
     solana_clock::{
         MAX_PROCESSING_AGE, MAX_TRANSACTION_FORWARDING_DELAY, MAX_TRANSACTION_FORWARDING_DELAY_GPU,
     },
-    solana_fee::{calculate_fee_details, FeeFeatures},
+    solana_fee::{apply_mcp_fee_component_values, calculate_fee_details, FeeFeatures},
     solana_fee_structure::{FeeBudgetLimits, FeeDetails},
     solana_nonce::{
         state::{Data as NonceData, DurableNonce, State as NonceState},
@@ -110,6 +110,21 @@ impl Bank {
                                 fee_budget.prioritization_fee,
                                 fee_features,
                             );
+                            let fee_details = if self.feature_set.is_active(&mcp_protocol_v1::id())
+                            {
+                                tx.borrow().mcp_fee_components().map_or(
+                                    fee_details,
+                                    |(inclusion_fee, ordering_fee)| {
+                                        apply_mcp_fee_component_values(
+                                            fee_details,
+                                            inclusion_fee,
+                                            ordering_fee,
+                                        )
+                                    },
+                                )
+                            } else {
+                                fee_details
+                            };
                             if let Some(compute_budget) = self.compute_budget {
                                 // This block of code is only necessary to retain legacy behavior of the code.
                                 // It should be removed along with the change to favor transaction's compute budget limits
