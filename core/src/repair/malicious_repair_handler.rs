@@ -1,5 +1,11 @@
 use {
-    super::{repair_handler::RepairHandler, repair_response::repair_response_packet_from_bytes},
+    super::{
+        repair_handler::RepairHandler,
+        repair_response::{
+            repair_response_packet_from_bytes,
+            repair_response_packet_from_bytes_with_optional_nonce,
+        },
+    },
     solana_clock::Slot,
     solana_hash::Hash,
     solana_ledger::{
@@ -60,5 +66,28 @@ impl RepairHandler for MaliciousRepairHandler {
             shred[Self::BAD_DATA_INDEX] = shred[Self::BAD_DATA_INDEX].wrapping_add(1);
         }
         repair_response_packet_from_bytes(shred, dest, nonce)
+    }
+
+    fn repair_response_packet_mcp(
+        &self,
+        slot: Slot,
+        proposer_index: u32,
+        shred_index: u32,
+        dest: &SocketAddr,
+        _nonce: Nonce,
+    ) -> Option<Packet> {
+        let mut shred = self
+            .blockstore
+            .get_mcp_shred_data(slot, proposer_index, shred_index)
+            .expect("Blockstore could not get MCP shred data")?;
+
+        if self
+            .config
+            .bad_shred_slot_frequency
+            .is_some_and(|freq| slot % freq == 0)
+        {
+            shred[Self::BAD_DATA_INDEX] = shred[Self::BAD_DATA_INDEX].wrapping_add(1);
+        }
+        repair_response_packet_from_bytes_with_optional_nonce(shred, dest, None)
     }
 }

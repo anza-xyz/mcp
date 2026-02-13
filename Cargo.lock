@@ -445,6 +445,7 @@ dependencies = [
  "agave-transaction-view",
  "bincode",
  "criterion",
+ "solana-compute-budget-instruction",
  "solana-hash",
  "solana-instruction",
  "solana-keypair",
@@ -8619,6 +8620,7 @@ name = "solana-fee"
 version = "3.1.0"
 dependencies = [
  "agave-feature-set",
+ "agave-transaction-view",
  "solana-fee-structure",
  "solana-svm-transaction",
 ]
@@ -9072,6 +9074,7 @@ dependencies = [
  "agave-feature-set",
  "agave-logger",
  "agave-reserved-account-keys",
+ "agave-transaction-view",
  "anyhow",
  "assert_matches",
  "bincode",
@@ -9252,6 +9255,7 @@ version = "3.1.0"
 dependencies = [
  "agave-feature-set",
  "agave-logger",
+ "agave-transaction-view",
  "assert_matches",
  "bincode",
  "crossbeam-channel",
@@ -10977,6 +10981,7 @@ dependencies = [
  "solana-compute-budget-program",
  "solana-ed25519-program",
  "solana-epoch-schedule",
+ "solana-fee",
  "solana-fee-calculator",
  "solana-fee-structure",
  "solana-frozen-abi",
@@ -11600,6 +11605,7 @@ version = "3.1.0"
 dependencies = [
  "agave-feature-set",
  "agave-logger",
+ "agave-transaction-view",
  "agave-xdp",
  "assert_matches",
  "bencher",
@@ -11619,9 +11625,11 @@ dependencies = [
  "rand_chacha 0.3.1",
  "rayon",
  "rustls 0.23.34",
+ "solana-account",
  "solana-clock",
  "solana-cluster-type",
  "solana-entry",
+ "solana-fee-structure",
  "solana-genesis-config",
  "solana-gossip",
  "solana-hash",
@@ -11640,6 +11648,7 @@ dependencies = [
  "solana-rpc",
  "solana-rpc-client-api",
  "solana-runtime",
+ "solana-runtime-transaction",
  "solana-sha256-hasher",
  "solana-signature",
  "solana-signer",
@@ -11922,6 +11931,7 @@ dependencies = [
 name = "solana-votor"
 version = "3.1.0"
 dependencies = [
+ "agave-feature-set",
  "agave-logger",
  "anyhow",
  "bincode",

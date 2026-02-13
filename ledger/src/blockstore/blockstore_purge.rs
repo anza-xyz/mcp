@@ -326,6 +326,18 @@ impl Blockstore {
                 .delete_range_in_batch(write_batch, from_slot, to_slot)
                 .is_ok()
             & self
+                .mcp_shred_data_cf
+                .delete_range_in_batch(write_batch, from_slot, to_slot)
+                .is_ok()
+            & self
+                .mcp_relay_attestation_cf
+                .delete_range_in_batch(write_batch, from_slot, to_slot)
+                .is_ok()
+            & self
+                .mcp_execution_output_cf
+                .delete_range_in_batch(write_batch, from_slot, to_slot)
+                .is_ok()
+            & self
                 .parent_meta_cf
                 .delete_range_in_batch(write_batch, from_slot, to_slot)
                 .is_ok()
@@ -431,6 +443,18 @@ impl Blockstore {
                 .is_ok()
             & self
                 .alt_merkle_root_meta_cf
+                .delete_file_in_range(from_slot, to_slot)
+                .is_ok()
+            & self
+                .mcp_shred_data_cf
+                .delete_file_in_range(from_slot, to_slot)
+                .is_ok()
+            & self
+                .mcp_relay_attestation_cf
+                .delete_file_in_range(from_slot, to_slot)
+                .is_ok()
+            & self
+                .mcp_execution_output_cf
                 .delete_file_in_range(from_slot, to_slot)
                 .is_ok()
             & self
@@ -587,6 +611,23 @@ pub mod tests {
 
         let (shreds, _) = make_many_slot_entries(0, 50, 5);
         blockstore.insert_shreds(shreds, None, false).unwrap();
+        for slot in 0..50 {
+            assert_eq!(
+                blockstore
+                    .put_mcp_shred_data(slot, 0, 0, &[slot as u8])
+                    .unwrap(),
+                McpPutStatus::Inserted
+            );
+            assert_eq!(
+                blockstore
+                    .put_mcp_relay_attestation(slot, 0, &[slot as u8, 1])
+                    .unwrap(),
+                McpPutStatus::Inserted
+            );
+            blockstore
+                .put_mcp_execution_output(slot, &[slot as u8])
+                .unwrap();
+        }
 
         blockstore.purge_and_compact_slots(0, 5);
 

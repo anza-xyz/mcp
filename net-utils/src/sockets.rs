@@ -11,8 +11,9 @@ use {
         sync::atomic::{AtomicU16, Ordering},
     },
 };
-// base port for deconflicted allocations
-pub(crate) const UNIQUE_ALLOC_BASE_PORT: u16 = 2000;
+// Base port for deconflicted test allocations.
+// Keep this high enough to avoid collisions with common host services.
+pub(crate) const UNIQUE_ALLOC_BASE_PORT: u16 = 10_000;
 // how much to allocate per individual process.
 // we expect to have at most 64 concurrent tests in CI at any moment on a given host.
 const SLICE_PER_PROCESS: u16 = (u16::MAX - UNIQUE_ALLOC_BASE_PORT) / 64;
@@ -60,10 +61,18 @@ pub fn localhost_port_range_for_tests() -> (u16, u16) {
 
 /// Bind a `UdpSocket` to a unique port.
 pub fn bind_to_localhost_unique() -> io::Result<UdpSocket> {
-    bind_to(
-        IpAddr::V4(Ipv4Addr::LOCALHOST),
-        unique_port_range_for_tests(1).start,
-    )
+    // A pre-assigned test port can still be occupied by an external process.
+    // Keep advancing through unique allocations before failing.
+    const BIND_RETRY_LIMIT: usize = 128;
+    for _ in 0..BIND_RETRY_LIMIT {
+        let port = unique_port_range_for_tests(1).start;
+        if let Ok(socket) = bind_to(IpAddr::V4(Ipv4Addr::LOCALHOST), port) {
+            return Ok(socket);
+        }
+    }
+    Err(io::Error::other(
+        "No available localhost UDP ports in unique test allocation window",
+    ))
 }
 
 pub fn bind_gossip_port_in_range(

@@ -6,6 +6,8 @@ mod bytes;
 
 mod address_table_lookup_frame;
 mod instructions_frame;
+pub mod mcp_payload;
+pub mod mcp_transaction;
 mod message_header_frame;
 pub mod resolved_transaction_view;
 pub mod result;

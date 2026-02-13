@@ -7,33 +7,78 @@ use {
     },
     crossbeam_channel::unbounded,
     itertools::Itertools,
-    solana_clock::MAX_PROCESSING_AGE,
-    solana_fee::FeeFeatures,
+    solana_account::ReadableAccount,
+    solana_clock::{Slot, MAX_PROCESSING_AGE},
+    solana_fee::{FeeFeatures, MCP_NUM_PROPOSERS},
     solana_fee_structure::FeeBudgetLimits,
     solana_measure::measure_us,
+    solana_nonce_account::{get_system_account_kind, SystemAccountKind},
     solana_poh::{
         poh_recorder::PohRecorderError,
         transaction_recorder::{
             RecordTransactionsSummary, RecordTransactionsTimings, TransactionRecorder,
         },
     },
+    solana_pubkey::Pubkey,
     solana_runtime::{
         bank::{Bank, LoadAndExecuteTransactionsOutput},
         transaction_batch::TransactionBatch,
     },
-    solana_runtime_transaction::transaction_with_meta::TransactionWithMeta,
+    solana_runtime_transaction::{
+        transaction_meta::StaticMeta, transaction_with_meta::TransactionWithMeta,
+    },
     solana_svm::{
-        account_loader::validate_fee_payer,
+        account_loader::{validate_fee_payer, validate_fee_payer_for_mcp},
         transaction_error_metrics::TransactionErrorMetrics,
         transaction_processing_result::TransactionProcessingResultExtensions,
         transaction_processor::{ExecutionRecordingConfig, TransactionProcessingConfig},
     },
     solana_transaction_error::TransactionError,
-    std::{num::Saturating, sync::Arc},
+    std::{collections::HashMap, num::Saturating, sync::Arc},
 };
 
 /// Consumer will create chunks of transactions from buffer with up to this size.
 pub const TARGET_NUM_TRANSACTIONS_PER_BATCH: usize = 64;
+
+#[derive(Default)]
+pub struct McpFeePayerTracker {
+    current_slot: Option<Slot>,
+    reserved_lamports_by_payer: HashMap<Pubkey, u64>,
+}
+
+impl McpFeePayerTracker {
+    pub fn try_reserve(
+        &mut self,
+        slot: Slot,
+        payer: Pubkey,
+        payer_lamports: u64,
+        nonce_min_balance: u64,
+        additional_fee: u64,
+    ) -> Result<(), TransactionError> {
+        if self.current_slot != Some(slot) {
+            self.current_slot = Some(slot);
+            self.reserved_lamports_by_payer.clear();
+        }
+
+        let available = payer_lamports
+            .checked_sub(nonce_min_balance)
+            .ok_or(TransactionError::InsufficientFundsForFee)?;
+        let currently_reserved = self
+            .reserved_lamports_by_payer
+            .get(&payer)
+            .copied()
+            .unwrap_or_default();
+        let next_reserved = currently_reserved
+            .checked_add(additional_fee)
+            .ok_or(TransactionError::InsufficientFundsForFee)?;
+        if next_reserved > available {
+            return Err(TransactionError::InsufficientFundsForFee);
+        }
+
+        self.reserved_lamports_by_payer.insert(payer, next_reserved);
+        Ok(())
+    }
+}
 
 pub struct ProcessTransactionBatchOutput {
     // The number of transactions filtered out by the cost model
@@ -312,6 +357,7 @@ impl Consumer {
                     recording_config: ExecutionRecordingConfig::new_single_setting(
                         transaction_status_sender_enabled
                     ),
+                    skip_fee_collection: false,
                 }
             ));
         execute_and_commit_timings.load_execute_us = load_execute_us;
@@ -491,6 +537,85 @@ impl Consumer {
             fee,
         )
     }
+
+    pub fn check_fee_payer_unlocked_mcp(
+        bank: &Bank,
+        transaction: &impl TransactionWithMeta,
+        fee_tracker: &mut McpFeePayerTracker,
+        error_counters: &mut TransactionErrorMetrics,
+    ) -> Result<(), TransactionError> {
+        let fee_payer = transaction.fee_payer();
+        let fee_budget_limits = FeeBudgetLimits::from(
+            transaction
+                .compute_budget_instruction_details()
+                .sanitize_and_convert_to_compute_budget_limits(&bank.feature_set)?,
+        );
+        let base_fee = solana_fee::calculate_fee(
+            transaction,
+            bank.get_lamports_per_signature() == 0,
+            bank.fee_structure().lamports_per_signature,
+            fee_budget_limits.prioritization_fee,
+            FeeFeatures::from(bank.feature_set.as_ref()),
+        );
+        let mcp_fee_components = transaction.mcp_fee_components().unwrap_or_default();
+        let effective_fee = base_fee
+            .checked_add(mcp_fee_components.0)
+            .and_then(|fee| fee.checked_add(mcp_fee_components.1))
+            .ok_or(TransactionError::InsufficientFundsForFee)?;
+
+        let (mut fee_payer_account, _slot) = bank
+            .rc
+            .accounts
+            .accounts_db
+            .load_with_fixed_root(&bank.ancestors, fee_payer)
+            .ok_or(TransactionError::AccountNotFound)?;
+
+        let nonce_min_balance = match get_system_account_kind(&fee_payer_account)
+            .ok_or(TransactionError::InvalidAccountForFee)?
+        {
+            SystemAccountKind::System => 0,
+            SystemAccountKind::Nonce => bank
+                .rent_collector()
+                .rent
+                .minimum_balance(solana_nonce::state::State::size()),
+        };
+        let scaled_fee = effective_fee
+            .checked_mul(MCP_NUM_PROPOSERS as u64)
+            .ok_or(TransactionError::InsufficientFundsForFee)?;
+        fee_tracker.try_reserve(
+            bank.slot(),
+            *fee_payer,
+            fee_payer_account.lamports(),
+            nonce_min_balance,
+            scaled_fee,
+        )?;
+
+        validate_fee_payer_for_mcp(
+            fee_payer,
+            &mut fee_payer_account,
+            0,
+            error_counters,
+            &bank.rent_collector().rent,
+            effective_fee,
+        )
+    }
+
+    pub fn check_fee_payer_unlocked_admission(
+        bank: &Bank,
+        transaction: &(impl TransactionWithMeta + StaticMeta),
+        fee_tracker: &mut McpFeePayerTracker,
+        error_counters: &mut TransactionErrorMetrics,
+    ) -> Result<(), TransactionError> {
+        let mcp_feature_active = bank
+            .feature_set
+            .activated_slot(&agave_feature_set::mcp_protocol_v1::id())
+            .is_some_and(|activated_slot| bank.slot() >= activated_slot);
+        if mcp_feature_active && transaction.mcp_fee_components().is_some() {
+            Self::check_fee_payer_unlocked_mcp(bank, transaction, fee_tracker, error_counters)
+        } else {
+            Self::check_fee_payer_unlocked(bank, transaction, error_counters)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -566,6 +691,27 @@ mod tests {
         );
         let consumer = Consumer::new(committer, recorder, QosService::new(1), None);
         consumer.process_and_record_transactions(&bank, &transactions)
+    }
+
+    #[test]
+    fn test_mcp_fee_payer_tracker_prevents_overcommit() {
+        let payer = Pubkey::new_unique();
+        let mut tracker = McpFeePayerTracker::default();
+
+        assert_eq!(tracker.try_reserve(10, payer, 1_000, 0, 600), Ok(()));
+        assert_eq!(
+            tracker.try_reserve(10, payer, 1_000, 0, 401),
+            Err(TransactionError::InsufficientFundsForFee)
+        );
+
+        // Slot change resets cumulative reservations.
+        assert_eq!(tracker.try_reserve(11, payer, 1_000, 0, 900), Ok(()));
+
+        // Nonce minimum balance is reserved.
+        assert_eq!(
+            tracker.try_reserve(11, payer, 1_000, 200, 801),
+            Err(TransactionError::InsufficientFundsForFee)
+        );
     }
 
     fn generate_new_address_lookup_table(

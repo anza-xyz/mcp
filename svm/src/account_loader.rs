@@ -17,6 +17,7 @@ use {
         PROGRAM_OWNERS,
     },
     solana_clock::Slot,
+    solana_fee::MCP_NUM_PROPOSERS,
     solana_fee_structure::FeeDetails,
     solana_instruction::{BorrowedAccountMeta, BorrowedInstruction},
     solana_instructions_sysvar::construct_instructions_data,
@@ -375,6 +376,45 @@ pub fn validate_fee_payer(
     rent: &Rent,
     fee: u64,
 ) -> Result<()> {
+    validate_fee_payer_with_multiplier(
+        payer_address,
+        payer_account,
+        payer_index,
+        error_metrics,
+        rent,
+        fee,
+        1,
+    )
+}
+
+pub fn validate_fee_payer_for_mcp(
+    payer_address: &Pubkey,
+    payer_account: &mut AccountSharedData,
+    payer_index: IndexOfAccount,
+    error_metrics: &mut TransactionErrorMetrics,
+    rent: &Rent,
+    fee: u64,
+) -> Result<()> {
+    validate_fee_payer_with_multiplier(
+        payer_address,
+        payer_account,
+        payer_index,
+        error_metrics,
+        rent,
+        fee,
+        MCP_NUM_PROPOSERS as u64,
+    )
+}
+
+pub fn validate_fee_payer_with_multiplier(
+    payer_address: &Pubkey,
+    payer_account: &mut AccountSharedData,
+    payer_index: IndexOfAccount,
+    error_metrics: &mut TransactionErrorMetrics,
+    rent: &Rent,
+    fee: u64,
+    fee_multiplier: u64,
+) -> Result<()> {
     if payer_account.lamports() == 0 {
         error_metrics.account_not_found += 1;
         return Err(TransactionError::AccountNotFound);
@@ -391,11 +431,15 @@ pub fn validate_fee_payer(
             rent.minimum_balance(NonceState::size())
         }
     };
+    let total_fee = fee.checked_mul(fee_multiplier).ok_or_else(|| {
+        error_metrics.insufficient_funds += 1;
+        TransactionError::InsufficientFundsForFee
+    })?;
 
     payer_account
         .lamports()
         .checked_sub(min_balance)
-        .and_then(|v| v.checked_sub(fee))
+        .and_then(|v| v.checked_sub(total_fee))
         .ok_or_else(|| {
             error_metrics.insufficient_funds += 1;
             TransactionError::InsufficientFundsForFee
@@ -403,7 +447,7 @@ pub fn validate_fee_payer(
 
     let payer_pre_rent_state = get_account_rent_state(rent, payer_account);
     payer_account
-        .checked_sub_lamports(fee)
+        .checked_sub_lamports(total_fee)
         .map_err(|_| TransactionError::InsufficientFundsForFee)?;
 
     let payer_post_rent_state = get_account_rent_state(rent, payer_account);
@@ -1489,6 +1533,64 @@ mod tests {
                 payer_post_balance: u64::MAX,
             },
             &rent,
+        );
+    }
+
+    #[test]
+    fn test_validate_fee_payer_for_mcp_multiplier() {
+        let rent = Rent {
+            lamports_per_byte_year: 1,
+            ..Rent::default()
+        };
+        let fee = 5_000;
+        let scaled_fee = fee * MCP_NUM_PROPOSERS as u64;
+        let min_balance = rent.minimum_balance(NonceState::size());
+        let payer = Keypair::new();
+
+        let mut system_account = AccountSharedData::new(scaled_fee, 0, &system_program::id());
+        assert_eq!(
+            validate_fee_payer_for_mcp(
+                &payer.pubkey(),
+                &mut system_account,
+                0,
+                &mut TransactionErrorMetrics::default(),
+                &rent,
+                fee,
+            ),
+            Ok(())
+        );
+        assert_eq!(system_account.lamports(), 0);
+
+        let mut nonce_account = AccountSharedData::new_data(
+            min_balance + scaled_fee,
+            &NonceVersions::new(NonceState::Initialized(nonce::state::Data::default())),
+            &system_program::id(),
+        )
+        .unwrap();
+        assert_eq!(
+            validate_fee_payer_for_mcp(
+                &payer.pubkey(),
+                &mut nonce_account,
+                0,
+                &mut TransactionErrorMetrics::default(),
+                &rent,
+                fee,
+            ),
+            Ok(())
+        );
+        assert_eq!(nonce_account.lamports(), min_balance);
+
+        let mut insufficient = AccountSharedData::new(scaled_fee - 1, 0, &system_program::id());
+        assert_eq!(
+            validate_fee_payer_for_mcp(
+                &payer.pubkey(),
+                &mut insufficient,
+                0,
+                &mut TransactionErrorMetrics::default(),
+                &rent,
+                fee,
+            ),
+            Err(TransactionError::InsufficientFundsForFee)
         );
     }
 

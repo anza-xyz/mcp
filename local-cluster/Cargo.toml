@@ -22,6 +22,7 @@ dev-context-only-utils = [
 [dependencies]
 agave-feature-set = { workspace = true }
 agave-logger = { workspace = true }
+agave-transaction-view = { workspace = true }
 bincode = { workspace = true }
 crossbeam-channel = { workspace = true }
 itertools = { workspace = true }

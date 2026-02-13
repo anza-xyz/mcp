@@ -6,8 +6,9 @@ use {
         transaction_with_meta::TransactionWithMeta,
     },
     agave_transaction_view::{
-        resolved_transaction_view::ResolvedTransactionView, transaction_data::TransactionData,
-        transaction_version::TransactionVersion, transaction_view::SanitizedTransactionView,
+        mcp_transaction::McpTransaction, resolved_transaction_view::ResolvedTransactionView,
+        transaction_data::TransactionData, transaction_version::TransactionVersion,
+        transaction_view::SanitizedTransactionView,
     },
     solana_message::{
         compiled_instruction::CompiledInstruction,
@@ -64,6 +65,27 @@ impl<D: TransactionData> RuntimeTransaction<SanitizedTransactionView<D>> {
         );
         let compute_budget_instruction_details =
             ComputeBudgetInstructionDetails::try_from(transaction.program_instructions_iter())?;
+        let mcp_fee_components = match McpTransaction::maybe_mcp_wire_prefix(transaction.data()) {
+            false => None,
+            true => match McpTransaction::from_bytes_compat(transaction.data()) {
+                Ok(mcp_tx) => {
+                    if mcp_tx.to_bytes().as_slice() == transaction.data() {
+                        // Latest MCP format may omit fee fields; missing values default to v0
+                        // behavior so sanitization remains backward-compatible.
+                        let inclusion_fee = u64::from(mcp_tx.inclusion_fee().unwrap_or_default());
+                        let ordering_fee = mcp_tx.ordering_fee_with_fallback();
+                        Some((inclusion_fee, ordering_fee))
+                    } else {
+                        // Legacy MCP layout has no ordering_fee field; use CU price.
+                        Some((
+                            0,
+                            compute_budget_instruction_details.requested_compute_unit_price(),
+                        ))
+                    }
+                }
+                Err(_) => None,
+            },
+        };
 
         Ok(Self {
             transaction,
@@ -73,6 +95,7 @@ impl<D: TransactionData> RuntimeTransaction<SanitizedTransactionView<D>> {
                 signature_details,
                 compute_budget_instruction_details,
                 instruction_data_len,
+                mcp_fee_components,
             },
         })
     }

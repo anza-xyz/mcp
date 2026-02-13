@@ -57,6 +57,15 @@ pub trait RepairHandler {
         nonce: Nonce,
     ) -> Option<Packet>;
 
+    fn repair_response_packet_mcp(
+        &self,
+        slot: Slot,
+        proposer_index: u32,
+        shred_index: u32,
+        dest: &SocketAddr,
+        nonce: Nonce,
+    ) -> Option<Packet>;
+
     fn run_window_request(
         &self,
         recycler: &PacketBatchRecycler,
@@ -93,6 +102,27 @@ pub trait RepairHandler {
             shred_index,
             Some(block_id),
             nonce,
+        )
+    }
+
+    fn run_mcp_window_request(
+        &self,
+        recycler: &PacketBatchRecycler,
+        from_addr: &SocketAddr,
+        slot: Slot,
+        proposer_index: u32,
+        shred_index: u32,
+        nonce: Nonce,
+    ) -> Option<PacketBatch> {
+        let packet =
+            self.repair_response_packet_mcp(slot, proposer_index, shred_index, from_addr, nonce)?;
+        Some(
+            PinnedPacketBatch::new_unpinned_with_recycler_data(
+                recycler,
+                "run_mcp_window_request",
+                vec![packet],
+            )
+            .into(),
         )
     }
 

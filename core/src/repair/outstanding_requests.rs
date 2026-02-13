@@ -66,6 +66,21 @@ where
 
         response
     }
+
+    pub fn register_response_without_nonce<R>(
+        &mut self,
+        response: &S,
+        now: u64,
+        success_fn: impl Fn(&T) -> R,
+    ) -> Option<R> {
+        let nonce = self.requests.iter().find_map(|(nonce, status)| {
+            (status.num_expected_responses > 0
+                && now < status.expire_timestamp
+                && status.request.verify_response(response))
+            .then_some(*nonce)
+        })?;
+        self.register_response(nonce, response, now, success_fn)
+    }
 }
 
 impl<T> Default for OutstandingRequests<T> {
@@ -197,6 +212,25 @@ pub(crate) mod tests {
                 .register_response(nonce, shred.payload(), expire_timestamp - 1, |_| ())
                 .is_some());
         }
+        assert!(outstanding_requests.requests.get(&nonce).is_none());
+    }
+
+    #[test]
+    fn test_register_response_without_nonce() {
+        let keypair = Keypair::new();
+        let shred = Shredder::single_shred_for_tests(9, &keypair);
+        let repair_type = ShredRepairType::Shred(9, u64::from(shred.index()));
+        let mut outstanding_requests = OutstandingRequests::default();
+        let nonce = outstanding_requests.add_request(repair_type, timestamp());
+        let expire_timestamp = outstanding_requests
+            .requests
+            .get(&nonce)
+            .unwrap()
+            .expire_timestamp;
+
+        assert!(outstanding_requests
+            .register_response_without_nonce(shred.payload(), expire_timestamp - 1, |_| ())
+            .is_some());
         assert!(outstanding_requests.requests.get(&nonce).is_none());
     }
 }
