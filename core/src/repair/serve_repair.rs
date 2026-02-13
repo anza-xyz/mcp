@@ -18,6 +18,7 @@ use {
             result::{Error, RepairVerifyError, Result},
         },
     },
+    agave_feature_set as feature_set,
     bincode::{serialize, Options},
     bytes::Bytes,
     crossbeam_channel::{Receiver, RecvTimeoutError},
@@ -41,6 +42,7 @@ use {
         blockstore_meta::BlockLocation,
         shred::{
             self,
+            mcp_shred::McpShred,
             merkle_tree::{self, SIZE_OF_MERKLE_PROOF_ENTRY},
             Nonce, ShredFetchStats, MAX_FEC_SETS_PER_SLOT, SIZE_OF_NONCE,
         },
@@ -114,6 +116,13 @@ pub enum ShredRepairType {
     /// Requesting the missing shred at a particular index
     Shred(Slot, u64),
 
+    /// Requesting an MCP shred by `(slot, proposer_index, shred_index)`.
+    McpShred {
+        slot: Slot,
+        proposer_index: u32,
+        shred_index: u32,
+    },
+
     /// Requesting the missing shred at a particular index for a specific block ID
     ShredForBlockId {
         slot: Slot,
@@ -130,6 +139,7 @@ impl ShredRepairType {
             ShredRepairType::Orphan(slot)
             | ShredRepairType::HighestShred(slot, _)
             | ShredRepairType::Shred(slot, _)
+            | ShredRepairType::McpShred { slot, .. }
             | ShredRepairType::ShredForBlockId { slot, .. } => *slot,
         }
     }
@@ -139,7 +149,8 @@ impl ShredRepairType {
             ShredRepairType::ShredForBlockId { block_id, .. } => Some(*block_id),
             ShredRepairType::Orphan(_)
             | ShredRepairType::HighestShred(_, _)
-            | ShredRepairType::Shred(_, _) => None,
+            | ShredRepairType::Shred(_, _)
+            | ShredRepairType::McpShred { .. } => None,
         }
     }
 }
@@ -150,6 +161,7 @@ impl RequestResponse for ShredRepairType {
         match self {
             ShredRepairType::Orphan(_) => MAX_ORPHAN_REPAIR_RESPONSES as u32,
             ShredRepairType::Shred(_, _) | ShredRepairType::HighestShred(_, _) => 1,
+            ShredRepairType::McpShred { .. } => 1,
             ShredRepairType::ShredForBlockId { .. } => 1,
         }
     }
@@ -169,6 +181,15 @@ impl RequestResponse for ShredRepairType {
             ShredRepairType::Shred(slot, index) => {
                 shred_slot == *slot && get_shred_index(shred) == Some(*index)
             }
+            ShredRepairType::McpShred {
+                slot,
+                proposer_index,
+                shred_index,
+            } => McpShred::from_bytes(shred).is_ok_and(|mcp_shred| {
+                mcp_shred.slot == *slot
+                    && mcp_shred.proposer_index == *proposer_index
+                    && mcp_shred.shred_index == *shred_index
+            }),
             ShredRepairType::ShredForBlockId {
                 slot,
                 index,
@@ -318,6 +339,7 @@ struct ServeRepairStats {
     total_response_bytes_unstaked: usize,
     processed: usize,
     window_index: usize,
+    mcp_window_index: usize,
     window_index_for_block_id: usize,
     highest_window_index: usize,
     highest_window_index_for_block_id: usize,
@@ -328,6 +350,7 @@ struct ServeRepairStats {
     parent: usize,
     fec_set_root: usize,
     window_index_misses: usize,
+    mcp_window_index_misses: usize,
     parent_misses: usize,
     fec_set_root_misses: usize,
     window_index_for_block_id_misses: usize,
@@ -394,6 +417,12 @@ pub enum RepairProtocol {
         header: RepairRequestHeader,
         slot: Slot,
         shred_index: u64,
+    },
+    McpWindowIndex {
+        header: RepairRequestHeader,
+        slot: Slot,
+        proposer_index: u32,
+        shred_index: u32,
     },
     HighestWindowIndex {
         header: RepairRequestHeader,
@@ -462,6 +491,7 @@ impl RepairProtocol {
             | Self::LegacyAncestorHashes => None,
             Self::Pong(pong) => Some(pong.from()),
             Self::WindowIndex { header, .. }
+            | Self::McpWindowIndex { header, .. }
             | Self::HighestWindowIndex { header, .. }
             | Self::Orphan { header, .. }
             | Self::AncestorHashes { header, .. }
@@ -482,6 +512,7 @@ impl RepairProtocol {
             | Self::LegacyAncestorHashes => false,
             Self::Pong(_)
             | Self::WindowIndex { .. }
+            | Self::McpWindowIndex { .. }
             | Self::HighestWindowIndex { .. }
             | Self::Orphan { .. }
             | Self::AncestorHashes { .. }
@@ -494,6 +525,7 @@ impl RepairProtocol {
     fn max_response_packets(&self) -> usize {
         match self {
             RepairProtocol::WindowIndex { .. }
+            | RepairProtocol::McpWindowIndex { .. }
             | RepairProtocol::HighestWindowIndex { .. }
             | RepairProtocol::AncestorHashes { .. }
             | RepairProtocol::ParentAndFecSetCount { .. }
@@ -647,6 +679,42 @@ impl ServeRepair {
                         stats.window_index_misses += 1;
                     }
                     (batch, "WindowIndexWithNonce")
+                }
+                RepairProtocol::McpWindowIndex {
+                    header: RepairRequestHeader { nonce, .. },
+                    slot,
+                    proposer_index,
+                    shred_index,
+                } => {
+                    stats.mcp_window_index += 1;
+                    let feature_active = self
+                        .sharable_banks
+                        .root()
+                        .feature_set
+                        .activated_slot(&feature_set::mcp_protocol_v1::id())
+                        .is_some_and(|activated_slot| *slot >= activated_slot);
+                    let batch = if feature_active {
+                        self.repair_handler.run_mcp_window_request(
+                            recycler,
+                            from_addr,
+                            *slot,
+                            *proposer_index,
+                            *shred_index,
+                            *nonce,
+                        )
+                    } else {
+                        None
+                    };
+                    if batch.is_none() {
+                        if !feature_active {
+                            inc_new_counter_error!(
+                                "serve_repair-mcp_window_index-before-feature",
+                                1
+                            );
+                        }
+                        stats.mcp_window_index_misses += 1;
+                    }
+                    (batch, "McpWindowIndexWithNonce")
                 }
                 RepairProtocol::HighestWindowIndex {
                     header: RepairRequestHeader { nonce, .. },
@@ -1059,6 +1127,7 @@ impl ServeRepair {
             ),
             ("self_repair", stats.err_self_repair, i64),
             ("window_index", stats.window_index, i64),
+            ("mcp_window_index", stats.mcp_window_index, i64),
             ("parent", stats.parent, i64),
             ("fec_set_root", stats.fec_set_root, i64),
             (
@@ -1085,6 +1154,11 @@ impl ServeRepair {
             ),
             ("pong", stats.pong, i64),
             ("window_index_misses", stats.window_index_misses, i64),
+            (
+                "mcp_window_index_misses",
+                stats.mcp_window_index_misses,
+                i64
+            ),
             ("parent_misses", stats.parent_misses, i64),
             ("fec_set_root_misses", stats.fec_set_root_misses, i64),
             (
@@ -1187,6 +1261,7 @@ impl ServeRepair {
                 }
             }
             RepairProtocol::WindowIndex { header, .. }
+            | RepairProtocol::McpWindowIndex { header, .. }
             | RepairProtocol::HighestWindowIndex { header, .. }
             | RepairProtocol::Orphan { header, .. }
             | RepairProtocol::AncestorHashes { header, .. }
@@ -1247,6 +1322,7 @@ impl ServeRepair {
         let ping_pkt = if let Some(ping) = ping {
             match request {
                 RepairProtocol::WindowIndex { .. }
+                | RepairProtocol::McpWindowIndex { .. }
                 | RepairProtocol::HighestWindowIndex { .. }
                 | RepairProtocol::Orphan { .. }
                 | RepairProtocol::ParentAndFecSetCount { .. }
@@ -1508,6 +1584,21 @@ impl ServeRepair {
                     shred_index: *shred_index,
                 }
             }
+            ShredRepairType::McpShred {
+                slot,
+                proposer_index,
+                shred_index,
+            } => {
+                repair_stats
+                    .mcp_shred
+                    .update(repair_peer_id, *slot, *shred_index as u64);
+                RepairProtocol::McpWindowIndex {
+                    header,
+                    slot: *slot,
+                    proposer_index: *proposer_index,
+                    shred_index: *shred_index,
+                }
+            }
             ShredRepairType::HighestShred(slot, shred_index) => {
                 repair_stats
                     .highest_shred
@@ -1667,6 +1758,7 @@ mod tests {
     use {
         super::*,
         crate::repair::repair_response,
+        agave_feature_set as feature_set,
         agave_feature_set::FeatureSet,
         solana_gossip::{contact_info::ContactInfo, socketaddr, socketaddr_any},
         solana_hash::Hash,
@@ -1677,7 +1769,9 @@ mod tests {
             genesis_utils::{create_genesis_config, GenesisConfigInfo},
             get_tmp_ledger_path_auto_delete,
             shred::{
-                max_ticks_per_n_shreds, ProcessShredsStats, ReedSolomonCache, Shred, Shredder,
+                max_ticks_per_n_shreds,
+                mcp_shred::{McpShred, MCP_SHRED_DATA_BYTES, MCP_WITNESS_LEN},
+                ProcessShredsStats, ReedSolomonCache, Shred, Shredder,
             },
         },
         solana_perf::packet::{deserialize_from_with_limit, Packet, PacketFlags, PacketRef},
@@ -2193,6 +2287,158 @@ mod tests {
         assert_eq!(rv[0].slot(), slot);
     }
 
+    #[test]
+    fn test_run_mcp_window_request() {
+        let slot = 7;
+        let proposer_index = 2;
+        let shred_index = 5;
+        let nonce = 11;
+        let recycler = PacketBatchRecycler::default();
+        let ledger_path = get_tmp_ledger_path_auto_delete!();
+        let blockstore = Arc::new(Blockstore::open(ledger_path.path()).unwrap());
+        let handler = StandardRepairHandler::new(blockstore.clone());
+
+        let mcp_shred = McpShred {
+            slot,
+            proposer_index,
+            shred_index,
+            commitment: [1u8; 32],
+            shred_data: [2u8; MCP_SHRED_DATA_BYTES],
+            witness: [[3u8; 32]; MCP_WITNESS_LEN],
+            proposer_signature: Signature::default(),
+        };
+        let payload = mcp_shred.to_bytes();
+        blockstore
+            .put_mcp_shred_data(slot, proposer_index, shred_index, &payload)
+            .unwrap();
+
+        let mut rv = handler
+            .run_mcp_window_request(
+                &recycler,
+                &socketaddr_any!(),
+                slot,
+                proposer_index,
+                shred_index,
+                nonce,
+            )
+            .expect("packets");
+        let request = ShredRepairType::McpShred {
+            slot,
+            proposer_index,
+            shred_index,
+        };
+        verify_responses(&request, rv.iter());
+        let mut packet = rv.get_mut(0).unwrap();
+        packet.meta_mut().flags |= PacketFlags::REPAIR;
+        let (shred, repair_nonce) =
+            shred::layout::get_shred_and_repair_nonce(packet.as_ref()).unwrap();
+        assert_eq!(repair_nonce, None);
+        assert_eq!(shred, payload.as_ref());
+    }
+
+    #[test]
+    fn test_handle_repair_mcp_window_request_requires_feature_activation() {
+        let slot = 11;
+        let proposer_index = 3;
+        let shred_index = 9;
+        let nonce = 17;
+        let recycler = PacketBatchRecycler::default();
+        let ledger_path = get_tmp_ledger_path_auto_delete!();
+        let blockstore = Arc::new(Blockstore::open(ledger_path.path()).unwrap());
+        let mcp_shred = McpShred {
+            slot,
+            proposer_index,
+            shred_index,
+            commitment: [1u8; 32],
+            shred_data: [2u8; MCP_SHRED_DATA_BYTES],
+            witness: [[3u8; 32]; MCP_WITNESS_LEN],
+            proposer_signature: Signature::default(),
+        };
+        blockstore
+            .put_mcp_shred_data(slot, proposer_index, shred_index, &mcp_shred.to_bytes())
+            .unwrap();
+
+        let cluster_info = Arc::new(new_test_cluster_info());
+        let whitelist = Arc::new(RwLock::new(HashSet::default()));
+        let handler: Box<dyn RepairHandler + Send + Sync> =
+            Box::new(StandardRepairHandler::new(blockstore.clone()));
+        let request = RepairProtocol::McpWindowIndex {
+            header: RepairRequestHeader {
+                signature: Signature::default(),
+                sender: cluster_info.id(),
+                recipient: cluster_info.id(),
+                timestamp: timestamp(),
+                nonce,
+            },
+            slot,
+            proposer_index,
+            shred_index,
+        };
+        let request_active = RepairProtocol::McpWindowIndex {
+            header: RepairRequestHeader {
+                signature: Signature::default(),
+                sender: cluster_info.id(),
+                recipient: cluster_info.id(),
+                timestamp: timestamp(),
+                nonce,
+            },
+            slot,
+            proposer_index,
+            shred_index,
+        };
+        let mut ping_cache = PingCache::new(
+            &mut rand::thread_rng(),
+            Instant::now(),
+            REPAIR_PING_CACHE_TTL,
+            REPAIR_PING_CACHE_RATE_LIMIT_DELAY,
+            REPAIR_PING_CACHE_CAPACITY,
+        );
+
+        let mut pre_feature_bank =
+            Bank::new_for_tests(&create_genesis_config(10_000).genesis_config);
+        pre_feature_bank.deactivate_feature(&feature_set::mcp_protocol_v1::id());
+        let pre_feature_bank_forks = BankForks::new_rw_arc(pre_feature_bank);
+        let pre_feature_serve_repair = ServeRepair::new(
+            cluster_info.clone(),
+            pre_feature_bank_forks.read().unwrap().sharable_banks(),
+            whitelist.clone(),
+            handler,
+            Arc::new(MigrationStatus::default()),
+        );
+        let mut stats = ServeRepairStats::default();
+        let response = pre_feature_serve_repair.handle_repair(
+            &recycler,
+            &socketaddr_any!(),
+            request,
+            &mut stats,
+            &mut ping_cache,
+        );
+        assert!(response.is_none());
+        assert_eq!(stats.mcp_window_index, 1);
+        assert_eq!(stats.mcp_window_index_misses, 1);
+
+        let mut active_bank = Bank::new_for_tests(&create_genesis_config(10_000).genesis_config);
+        active_bank.activate_feature(&feature_set::mcp_protocol_v1::id());
+        let active_bank_forks = BankForks::new_rw_arc(active_bank);
+        let active_serve_repair = ServeRepair::new(
+            cluster_info,
+            active_bank_forks.read().unwrap().sharable_banks(),
+            whitelist,
+            Box::new(StandardRepairHandler::new(blockstore)),
+            Arc::new(MigrationStatus::default()),
+        );
+        let mut active_stats = ServeRepairStats::default();
+        let response = active_serve_repair.handle_repair(
+            &recycler,
+            &socketaddr_any!(),
+            request_active,
+            &mut active_stats,
+            &mut ping_cache,
+        );
+        assert!(response.is_some());
+        assert_eq!(active_stats.mcp_window_index, 1);
+    }
+
     fn new_test_cluster_info() -> ClusterInfo {
         let keypair = Arc::new(Keypair::new());
         let contact_info = ContactInfo::new_localhost(&keypair.pubkey(), timestamp());
@@ -2649,6 +2895,7 @@ mod tests {
             ShredRepairType::Orphan(_)
             | ShredRepairType::HighestShred(_, _)
             | ShredRepairType::Shred(_, _)
+            | ShredRepairType::McpShred { .. }
             | ShredRepairType::ShredForBlockId { .. } => (),
         };
 
@@ -2685,6 +2932,26 @@ mod tests {
         assert!(!request.verify_response(shred.payload()));
         let shred = new_test_data_shred(slot + 1, index);
         assert!(!request.verify_response(shred.payload()));
+
+        // McpShred
+        let request = ShredRepairType::McpShred {
+            slot,
+            proposer_index: 3,
+            shred_index: index,
+        };
+        let mcp_shred = McpShred {
+            slot,
+            proposer_index: 3,
+            shred_index: index,
+            commitment: [0u8; 32],
+            shred_data: [0u8; MCP_SHRED_DATA_BYTES],
+            witness: [[0u8; 32]; MCP_WITNESS_LEN],
+            proposer_signature: Signature::default(),
+        };
+        assert!(request.verify_response(&mcp_shred.to_bytes()));
+        let mut wrong_index = mcp_shred.clone();
+        wrong_index.shred_index = wrong_index.shred_index.saturating_add(1);
+        assert!(!request.verify_response(&wrong_index.to_bytes()));
     }
 
     fn verify_responses<'a>(

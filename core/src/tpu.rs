@@ -346,7 +346,11 @@ impl Tpu {
             client,
             vote_forwarding_client_socket,
             bank_forks.read().unwrap().sharable_banks(),
-            ForwardAddressGetter::new(cluster_info.clone(), poh_recorder.clone()),
+            ForwardAddressGetter::new(
+                cluster_info.clone(),
+                poh_recorder.clone(),
+                bank_forks.read().unwrap().sharable_banks(),
+            ),
             DataBudget::default(),
         );
 

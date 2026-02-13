@@ -4,7 +4,7 @@
 use {
     crate::shred::{
         self, merkle_tree::SIZE_OF_MERKLE_ROOT, traits::Shred, Error, Nonce, ShredFlags, ShredId,
-        ShredType, ShredVariant, SIZE_OF_COMMON_SHRED_HEADER,
+        ShredType, ShredVariant, SIZE_OF_COMMON_SHRED_HEADER, SIZE_OF_NONCE,
     },
     solana_clock::Slot,
     solana_hash::Hash,
@@ -23,10 +23,18 @@ use {
 
 #[inline]
 fn get_shred_size(shred: &[u8]) -> Option<usize> {
-    match get_shred_variant(shred).ok()? {
-        ShredVariant::MerkleCode { .. } => Some(shred::merkle::ShredCode::SIZE_OF_PAYLOAD),
-        ShredVariant::MerkleData { .. } => Some(shred::merkle::ShredData::SIZE_OF_PAYLOAD),
+    if let Ok(variant) = get_shred_variant(shred) {
+        return match variant {
+            ShredVariant::MerkleCode { .. } => Some(shred::merkle::ShredCode::SIZE_OF_PAYLOAD),
+            ShredVariant::MerkleData { .. } => Some(shred::merkle::ShredData::SIZE_OF_PAYLOAD),
+        };
     }
+
+    // MCP repair responses can carry raw MCP shred bytes without Agave
+    // ShredVariant headers. Detect MCP shred prefix directly.
+    let mcp_wire_size = shred::mcp_shred::MCP_SHRED_WIRE_SIZE;
+    let prefix = shred.get(..mcp_wire_size)?;
+    shred::mcp_shred::is_mcp_shred_bytes(prefix).then_some(mcp_wire_size)
 }
 
 #[inline]
@@ -50,10 +58,14 @@ pub fn get_shred_and_repair_nonce(packet: PacketRef) -> Option<(&[u8], Option<No
     if !packet.meta().repair() {
         return Some((shred, None));
     }
-    let offset = data.len().checked_sub(4)?;
-    let nonce = <[u8; 4]>::try_from(data.get(offset..)?).ok()?;
-    let nonce = u32::from_le_bytes(nonce);
-    Some((shred, Some(nonce)))
+    if data.len() == shred.len() {
+        return Some((shred, None));
+    }
+    if data.len() != shred.len() + SIZE_OF_NONCE {
+        return None;
+    }
+    let nonce = <[u8; SIZE_OF_NONCE]>::try_from(data.get(shred.len()..)?).ok()?;
+    Some((shred, Some(u32::from_le_bytes(nonce))))
 }
 
 #[inline]
@@ -418,7 +430,11 @@ pub(crate) fn corrupt_packet<R: Rng>(
 mod tests {
     use {
         super::*,
-        crate::shred::{tests::make_merkle_shreds_for_tests, traits::ShredData},
+        crate::shred::{
+            mcp_shred::{McpShred, MCP_SHRED_DATA_BYTES, MCP_WITNESS_LEN},
+            tests::make_merkle_shreds_for_tests,
+            traits::ShredData,
+        },
         assert_matches::assert_matches,
         rand::Rng,
         solana_perf::packet::PacketFlags,
@@ -642,5 +658,28 @@ mod tests {
                 });
             }
         }
+    }
+
+    #[test]
+    fn test_get_shred_and_repair_nonce_for_mcp_shred_payload_without_nonce() {
+        let mcp_shred = McpShred {
+            slot: 42,
+            proposer_index: 1,
+            shred_index: 2,
+            commitment: [3u8; 32],
+            shred_data: [4u8; MCP_SHRED_DATA_BYTES],
+            witness: [[5u8; 32]; MCP_WITNESS_LEN],
+            proposer_signature: Signature::default(),
+        };
+        let mcp_bytes = mcp_shred.to_bytes();
+        let mut packet = Packet::default();
+        packet.buffer_mut()[..mcp_bytes.len()].copy_from_slice(&mcp_bytes);
+        packet.meta_mut().size = mcp_bytes.len();
+        packet.meta_mut().flags |= PacketFlags::REPAIR;
+
+        assert_eq!(
+            get_shred_and_repair_nonce(PacketRef::Packet(&packet)),
+            Some((mcp_bytes.as_ref(), None)),
+        );
     }
 }

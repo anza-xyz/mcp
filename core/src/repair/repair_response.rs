@@ -28,17 +28,27 @@ pub fn repair_response_packet_from_bytes(
     dest: &SocketAddr,
     nonce: Nonce,
 ) -> Option<Packet> {
+    repair_response_packet_from_bytes_with_optional_nonce(bytes, dest, Some(nonce))
+}
+
+pub fn repair_response_packet_from_bytes_with_optional_nonce(
+    bytes: impl AsRef<[u8]>,
+    dest: &SocketAddr,
+    nonce: Option<Nonce>,
+) -> Option<Packet> {
     let bytes = bytes.as_ref();
     let mut packet = Packet::default();
-    let size = bytes.len() + SIZE_OF_NONCE;
+    let size = bytes.len() + nonce.map_or(0, |_| SIZE_OF_NONCE);
     if size > packet.buffer_mut().len() {
         return None;
     }
     packet.meta_mut().size = size;
     packet.meta_mut().set_socket_addr(dest);
     packet.buffer_mut()[..bytes.len()].copy_from_slice(bytes);
-    let mut wr = io::Cursor::new(&mut packet.buffer_mut()[bytes.len()..]);
-    bincode::serialize_into(&mut wr, &nonce).expect("Buffer not large enough to fit nonce");
+    if let Some(nonce) = nonce {
+        let mut wr = io::Cursor::new(&mut packet.buffer_mut()[bytes.len()..]);
+        bincode::serialize_into(&mut wr, &nonce).expect("Buffer not large enough to fit nonce");
+    }
     Some(packet)
 }
 
@@ -51,7 +61,7 @@ mod test {
             shred::Shredder,
             sigverify_shreds::{verify_shred_cpu, LruCache, SlotPubkeys},
         },
-        solana_packet::PacketFlags,
+        solana_packet::{PacketFlags, PACKET_DATA_SIZE},
         solana_signer::Signer,
         std::{
             collections::HashMap,
@@ -90,5 +100,15 @@ mod test {
     #[test]
     fn test_sigverify_shred_cpu_repair() {
         run_test_sigverify_shred_cpu_repair(0xdead_c0de);
+    }
+
+    #[test]
+    fn test_repair_response_packet_from_bytes_without_nonce_allows_full_payload() {
+        let dest = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8080);
+        let bytes = vec![9u8; PACKET_DATA_SIZE];
+        assert!(
+            repair_response_packet_from_bytes_with_optional_nonce(&bytes, &dest, None).is_some()
+        );
+        assert!(repair_response_packet_from_bytes(&bytes, &dest, 7).is_none());
     }
 }

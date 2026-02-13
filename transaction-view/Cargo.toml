@@ -13,6 +13,7 @@ edition = { workspace = true }
 dev-context-only-utils = []
 
 [dependencies]
+solana-compute-budget-instruction = { workspace = true }
 solana-hash = { workspace = true }
 solana-message = { workspace = true }
 solana-packet = { workspace = true }

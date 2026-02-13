@@ -507,10 +507,10 @@ impl BlockComponent {
     }
 
     pub fn infer_is_entry_batch(data: &[u8]) -> Option<bool> {
-        data.get(..Self::ENTRY_COUNT_SIZE)?
-            .try_into()
-            .ok()
-            .map(|b| u64::from_le_bytes(b) != 0)
+        let bytes: [u8; Self::ENTRY_COUNT_SIZE] =
+            data.get(..Self::ENTRY_COUNT_SIZE)?.try_into().ok()?;
+        let entry_count = u64::from_le_bytes(bytes);
+        Some(entry_count != 0 || data.len() == Self::ENTRY_COUNT_SIZE)
     }
 
     pub fn infer_is_block_marker(data: &[u8]) -> Option<bool> {
@@ -566,6 +566,14 @@ impl<'de> SchemaRead<'de> for BlockComponent {
         let entry_count = u64::from_le_bytes(*count_bytes);
 
         if entry_count == 0 {
+            // bincode-encoded empty Vec<Entry> is exactly 8 zero bytes.
+            // Disambiguate it from BlockMarker by checking if any marker payload exists.
+            let data = reader.fill_buf(usize::MAX)?;
+            if data.len() == Self::ENTRY_COUNT_SIZE {
+                reader.consume(Self::ENTRY_COUNT_SIZE)?;
+                dst.write(Self::EntryBatch(Vec::new()));
+                return Ok(());
+            }
             // This is a BlockMarker - consume the count bytes and read the marker
             reader.consume(8)?;
             dst.write(Self::BlockMarker(VersionedBlockMarker::get(reader)?));
@@ -613,8 +621,19 @@ mod tests {
             block_producer_time_nanos: 1234567890,
             block_user_agent: b"test-agent".to_vec(),
             final_cert: Some(FinalCertificate::new_for_tests()),
-            skip_reward_cert: Some(SkipRewardCertificate::new_for_tests()),
-            notar_reward_cert: Some(NotarRewardCertificate::new_for_tests()),
+            skip_reward_cert: Some(
+                SkipRewardCertificate::try_new(1234, BLSSignatureCompressed::default(), vec![4, 2])
+                    .unwrap(),
+            ),
+            notar_reward_cert: Some(
+                NotarRewardCertificate::try_new(
+                    1234,
+                    Hash::new_unique(),
+                    BLSSignatureCompressed::default(),
+                    vec![4, 2],
+                )
+                .unwrap(),
+            ),
         }
     }
 
@@ -662,6 +681,56 @@ mod tests {
         assert_eq!(comp, deser);
 
         let comp = BlockComponent::new_block_marker(marker);
+        let bytes = wincode::serialize(&comp).unwrap();
+        let deser: BlockComponent = wincode::deserialize(&bytes).unwrap();
+        assert_eq!(comp, deser);
+
+        let comp = BlockComponent::EntryBatch(vec![]);
+        let bytes = wincode::serialize(&comp).unwrap();
+        let deser: BlockComponent = wincode::deserialize(&bytes).unwrap();
+        assert_eq!(comp, deser);
+    }
+
+    #[test]
+    fn test_new_entry_batch_rejects_empty() {
+        assert!(matches!(
+            BlockComponent::new_entry_batch(vec![]),
+            Err(BlockComponentError::EmptyEntryBatch),
+        ));
+    }
+
+    #[test]
+    fn test_infer_helpers_disambiguate_empty_entry_batch() {
+        let bytes = wincode::serialize(&BlockComponent::EntryBatch(vec![])).unwrap();
+        assert_eq!(bytes.len(), BlockComponent::ENTRY_COUNT_SIZE);
+        assert_eq!(BlockComponent::infer_is_entry_batch(&bytes), Some(true));
+        assert_eq!(BlockComponent::infer_is_block_marker(&bytes), Some(false));
+
+        let marker = BlockComponent::new_block_marker(VersionedBlockMarker::new_block_header(
+            BlockHeaderV1 {
+                parent_slot: 1,
+                parent_block_id: Hash::new_unique(),
+            },
+        ));
+        let marker_bytes = wincode::serialize(&marker).unwrap();
+        assert!(marker_bytes.len() > BlockComponent::ENTRY_COUNT_SIZE);
+        assert_eq!(
+            BlockComponent::infer_is_entry_batch(&marker_bytes),
+            Some(false)
+        );
+        assert_eq!(
+            BlockComponent::infer_is_block_marker(&marker_bytes),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn test_update_parent_marker_round_trip() {
+        let update_parent = VersionedBlockMarker::new_update_parent(UpdateParentV1 {
+            new_parent_slot: 42,
+            new_parent_block_id: Hash::new_unique(),
+        });
+        let comp = BlockComponent::new_block_marker(update_parent);
         let bytes = wincode::serialize(&comp).unwrap();
         let deser: BlockComponent = wincode::deserialize(&bytes).unwrap();
         assert_eq!(comp, deser);

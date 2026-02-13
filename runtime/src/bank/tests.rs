@@ -100,6 +100,7 @@ use {
         account_loader::{FeesOnlyTransaction, LoadedTransaction},
         rollback_accounts::RollbackAccounts,
         transaction_commit_result::TransactionCommitResultExtensions,
+        transaction_error_metrics::TransactionErrorMetrics,
         transaction_execution_result::ExecutedTransaction,
     },
     solana_svm_timings::ExecuteTimings,
@@ -1375,6 +1376,205 @@ fn test_bank_withdraw_from_nonce_account() {
         bank.withdraw(&nonce.pubkey(), min_balance),
         Err(TransactionError::InsufficientFundsForFee),
     );
+}
+
+#[test]
+fn test_collect_fees_only_for_transactions_debits_fee_payer() {
+    let leader = solana_pubkey::new_rand();
+    let GenesisConfigInfo {
+        mut genesis_config,
+        mint_keypair,
+        ..
+    } = create_genesis_config_with_leader(100_000, &leader, 3);
+    genesis_config.fee_rate_governor = FeeRateGovernor::new(5_000, 0);
+    let bank = Bank::new_for_tests(&genesis_config);
+
+    let recipient = solana_pubkey::new_rand();
+    let tx = RuntimeTransaction::from_transaction_for_tests(system_transaction::transfer(
+        &mint_keypair,
+        &recipient,
+        1,
+        bank.last_blockhash(),
+    ));
+    let batch = bank.prepare_unlocked_batch_from_single_tx(&tx);
+
+    let before = bank.get_balance(&mint_keypair.pubkey());
+    let mut error_counters = TransactionErrorMetrics::default();
+    let fee_results =
+        bank.collect_fees_only_for_transactions(&batch, MAX_PROCESSING_AGE, &mut error_counters);
+
+    assert_eq!(fee_results.len(), 1);
+    assert_eq!(fee_results[0].as_ref().unwrap().total_fee(), 5_000);
+    assert_eq!(bank.get_balance(&mint_keypair.pubkey()), before - 5_000);
+    assert_eq!(bank.get_balance(&recipient), 0);
+}
+
+#[test]
+fn test_collect_fees_only_for_transactions_tracks_cumulative_payer_balance() {
+    let leader = solana_pubkey::new_rand();
+    let GenesisConfigInfo {
+        mut genesis_config,
+        mint_keypair,
+        ..
+    } = create_genesis_config_with_leader(9_000, &leader, 3);
+    genesis_config.fee_rate_governor = FeeRateGovernor::new(5_000, 0);
+    let bank = Bank::new_for_tests(&genesis_config);
+
+    let recipient_a = solana_pubkey::new_rand();
+    let recipient_b = solana_pubkey::new_rand();
+    let txs = vec![
+        RuntimeTransaction::from_transaction_for_tests(system_transaction::transfer(
+            &mint_keypair,
+            &recipient_a,
+            1,
+            bank.last_blockhash(),
+        )),
+        RuntimeTransaction::from_transaction_for_tests(system_transaction::transfer(
+            &mint_keypair,
+            &recipient_b,
+            1,
+            bank.last_blockhash(),
+        )),
+    ];
+    let batch = bank.prepare_sanitized_batch(&txs);
+
+    let mut error_counters = TransactionErrorMetrics::default();
+    let fee_results =
+        bank.collect_fees_only_for_transactions(&batch, MAX_PROCESSING_AGE, &mut error_counters);
+
+    assert_eq!(fee_results.len(), 2);
+    assert!(fee_results[0].is_ok());
+    assert_eq!(
+        fee_results[1],
+        Err(TransactionError::InsufficientFundsForFee)
+    );
+    assert_eq!(bank.get_balance(&mint_keypair.pubkey()), 4_000);
+    assert_eq!(bank.get_balance(&recipient_a), 0);
+    assert_eq!(bank.get_balance(&recipient_b), 0);
+}
+
+#[test]
+fn test_collect_fees_only_for_transactions_rejects_payer_below_fee() {
+    let leader = solana_pubkey::new_rand();
+    let GenesisConfigInfo {
+        mut genesis_config,
+        mint_keypair,
+        ..
+    } = create_genesis_config_with_leader(4_000, &leader, 3);
+    genesis_config.fee_rate_governor = FeeRateGovernor::new(5_000, 0);
+    let bank = Bank::new_for_tests(&genesis_config);
+
+    let recipient = solana_pubkey::new_rand();
+    let tx = RuntimeTransaction::from_transaction_for_tests(system_transaction::transfer(
+        &mint_keypair,
+        &recipient,
+        1,
+        bank.last_blockhash(),
+    ));
+    let batch = bank.prepare_unlocked_batch_from_single_tx(&tx);
+    let before = bank.get_balance(&mint_keypair.pubkey());
+
+    let mut error_counters = TransactionErrorMetrics::default();
+    let fee_results =
+        bank.collect_fees_only_for_transactions(&batch, MAX_PROCESSING_AGE, &mut error_counters);
+
+    assert_eq!(fee_results.len(), 1);
+    assert_eq!(
+        fee_results[0],
+        Err(TransactionError::InsufficientFundsForFee)
+    );
+    assert_eq!(bank.get_balance(&mint_keypair.pubkey()), before);
+    assert_eq!(bank.get_balance(&recipient), 0);
+}
+
+#[test]
+fn test_collect_fees_only_for_nonce_transaction_debits_fee_plus_nonce_rent() {
+    let (bank, _mint_keypair, _custodian_keypair, nonce_keypair, _bank_forks) =
+        setup_nonce_with_bank(
+            10_000_000,
+            |genesis_config| {
+                genesis_config.fee_rate_governor = FeeRateGovernor::new(5_000, 0);
+                genesis_config.rent.lamports_per_byte_year = 42;
+            },
+            5_000_000,
+            1_000_000,
+            None,
+            FeatureSet::all_enabled(),
+        )
+        .unwrap();
+
+    let nonce_pubkey = nonce_keypair.pubkey();
+    let nonce_hash = get_nonce_blockhash(&bank, &nonce_pubkey).unwrap();
+    let tx = RuntimeTransaction::from_transaction_for_tests(Transaction::new_signed_with_payer(
+        &[system_instruction::advance_nonce_account(
+            &nonce_pubkey,
+            &nonce_pubkey,
+        )],
+        Some(&nonce_pubkey),
+        &[&nonce_keypair],
+        nonce_hash,
+    ));
+    let batch = bank.prepare_unlocked_batch_from_single_tx(&tx);
+
+    let nonce_min_balance =
+        bank.get_minimum_balance_for_rent_exemption(nonce::state::State::size());
+    let before = bank.get_balance(&nonce_pubkey);
+    let mut error_counters = TransactionErrorMetrics::default();
+    let fee_results =
+        bank.collect_fees_only_for_transactions(&batch, MAX_PROCESSING_AGE, &mut error_counters);
+
+    assert_eq!(fee_results.len(), 1);
+    assert_eq!(fee_results[0].as_ref().unwrap().total_fee(), 5_000);
+    assert_eq!(
+        bank.get_balance(&nonce_pubkey),
+        before - (5_000 + nonce_min_balance),
+    );
+}
+
+#[test]
+fn test_collect_fees_only_for_nonce_transaction_accepts_exact_fee_plus_nonce_rent_balance() {
+    let (bank, _mint_keypair, _custodian_keypair, nonce_keypair, _bank_forks) =
+        setup_nonce_with_bank(
+            10_000_000,
+            |genesis_config| {
+                genesis_config.fee_rate_governor = FeeRateGovernor::new(5_000, 0);
+                genesis_config.rent.lamports_per_byte_year = 42;
+            },
+            5_000_000,
+            1_000_000,
+            None,
+            FeatureSet::all_enabled(),
+        )
+        .unwrap();
+
+    let nonce_pubkey = nonce_keypair.pubkey();
+    let nonce_min_balance =
+        bank.get_minimum_balance_for_rent_exemption(nonce::state::State::size());
+    let exact_required_balance = 5_000 + nonce_min_balance;
+
+    let mut nonce_account = bank.get_account_with_fixed_root(&nonce_pubkey).unwrap();
+    nonce_account.set_lamports(exact_required_balance);
+    bank.store_account(&nonce_pubkey, &nonce_account);
+
+    let nonce_hash = get_nonce_blockhash(&bank, &nonce_pubkey).unwrap();
+    let tx = RuntimeTransaction::from_transaction_for_tests(Transaction::new_signed_with_payer(
+        &[system_instruction::advance_nonce_account(
+            &nonce_pubkey,
+            &nonce_pubkey,
+        )],
+        Some(&nonce_pubkey),
+        &[&nonce_keypair],
+        nonce_hash,
+    ));
+    let batch = bank.prepare_unlocked_batch_from_single_tx(&tx);
+
+    let mut error_counters = TransactionErrorMetrics::default();
+    let fee_results =
+        bank.collect_fees_only_for_transactions(&batch, MAX_PROCESSING_AGE, &mut error_counters);
+
+    assert_eq!(fee_results.len(), 1);
+    assert!(fee_results[0].is_ok());
+    assert_eq!(bank.get_balance(&nonce_pubkey), 0);
 }
 
 #[test]

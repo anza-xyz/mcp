@@ -33,7 +33,7 @@ impl LeaderSchedule {
         Self::new_from_schedule(vote_keyed_slot_leaders, vote_accounts_map)
     }
 
-    fn new_from_schedule(
+    pub(crate) fn new_from_schedule(
         vote_keyed_slot_leaders: Vec<Pubkey>,
         vote_accounts_map: &VoteAccountsHashMap,
     ) -> Self {
