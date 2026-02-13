@@ -18,6 +18,8 @@ use {
         consensus::{tower_storage::TowerStorage, Tower},
         cost_update_service::CostUpdateService,
         drop_bank_service::DropBankService,
+        mcp_relay_submit::RelayAttestationV1,
+        mcp_replay,
         repair::repair_service::{OutstandingShredRepairs, RepairInfo, RepairServiceChannels},
         replay_stage::{ReplayReceivers, ReplaySenders, ReplayStage, ReplayStageConfig},
         shred_fetch_stage::{ShredFetchStage, SHRED_FETCH_CHANNEL_SIZE},
@@ -69,7 +71,7 @@ use {
     },
     solana_votor_messages::migration::MigrationStatus,
     std::{
-        collections::HashSet,
+        collections::{HashMap, HashSet},
         net::{SocketAddr, UdpSocket},
         num::NonZeroUsize,
         sync::{atomic::AtomicBool, Arc, RwLock},
@@ -102,6 +104,8 @@ pub struct Tvu {
     duplicate_shred_listener: DuplicateShredListener,
     alpenglow_sigverify_service: BLSSigverifyService,
     alpenglow_quic_t: thread::JoinHandle<()>,
+    _mcp_relay_attestation_sender: Sender<RelayAttestationV1>,
+    mcp_consensus_blocks: mcp_replay::McpConsensusBlockStore,
 }
 
 // The maximum number of alpenglow packets that can be processed in a single batch
@@ -236,6 +240,9 @@ impl Tvu {
 
         let (fetch_sender, fetch_receiver) = EvictingSender::new_bounded(SHRED_FETCH_CHANNEL_SIZE);
         let (bls_packet_sender, bls_packet_receiver) = bounded(MAX_ALPENGLOW_PACKET_NUM);
+        const MCP_CONTROL_MESSAGE_CHANNEL_CAPACITY: usize = 10_000;
+        let (mcp_control_message_sender, mcp_control_message_receiver) =
+            bounded(MCP_CONTROL_MESSAGE_CHANNEL_CAPACITY);
 
         let repair_socket = Arc::new(repair_socket);
         let ancestor_hashes_socket = Arc::new(ancestor_hashes_socket);
@@ -244,6 +251,7 @@ impl Tvu {
         let fetch_stage = ShredFetchStage::new(
             fetch_sockets,
             turbine_quic_endpoint_receiver,
+            Some(mcp_control_message_sender),
             repair_response_quic_receiver,
             repair_socket.clone(),
             fetch_sender,
@@ -313,7 +321,7 @@ impl Tvu {
             leader_schedule_cache.clone(),
             cluster_info.clone(),
             Arc::new(retransmit_sockets),
-            turbine_quic_endpoint_sender,
+            turbine_quic_endpoint_sender.clone(),
             retransmit_receiver,
             max_slots.clone(),
             rpc_subscriptions.clone(),
@@ -329,6 +337,10 @@ impl Tvu {
             unbounded();
         let (dumped_slots_sender, dumped_slots_receiver) = unbounded();
         let (popular_pruned_forks_sender, popular_pruned_forks_receiver) = unbounded();
+        const MCP_RELAY_ATTESTATION_CHANNEL_CAPACITY: usize = 10_000;
+        let (mcp_relay_attestation_sender, mcp_relay_attestation_receiver) =
+            bounded(MCP_RELAY_ATTESTATION_CHANNEL_CAPACITY);
+        let mcp_consensus_blocks = Arc::new(RwLock::new(HashMap::new()));
         let window_service = {
             let epoch_schedule = bank_forks
                 .read()
@@ -362,6 +374,11 @@ impl Tvu {
                 completed_data_sets_sender,
                 duplicate_slots_sender.clone(),
                 repair_service_channels,
+                Some(mcp_relay_attestation_sender.clone()),
+                Some(mcp_relay_attestation_receiver),
+                Some(mcp_control_message_receiver),
+                Some(mcp_consensus_blocks.clone()),
+                Some(turbine_quic_endpoint_sender.clone()),
             );
             WindowService::new(
                 blockstore.clone(),
@@ -458,6 +475,9 @@ impl Tvu {
             consensus_metrics_sender: consensus_metrics_sender.clone(),
             consensus_metrics_receiver,
             migration_status,
+            mcp_consensus_blocks: mcp_consensus_blocks.clone(),
+            mcp_vote_gate_inputs: Arc::new(RwLock::new(HashMap::new())),
+            mcp_vote_gate_included_proposers: Arc::new(RwLock::new(HashMap::new())),
             reward_votes_receiver,
             build_reward_certs_receiver,
             reward_certs_sender,
@@ -536,7 +556,16 @@ impl Tvu {
             duplicate_shred_listener,
             alpenglow_sigverify_service,
             alpenglow_quic_t,
+            _mcp_relay_attestation_sender: mcp_relay_attestation_sender,
+            mcp_consensus_blocks,
         })
+    }
+
+    pub fn mcp_consensus_block_bytes(&self, slot: Slot) -> Option<Vec<u8>> {
+        self.mcp_consensus_blocks
+            .read()
+            .ok()
+            .and_then(|blocks| blocks.get(&slot).cloned())
     }
 
     pub fn join(self) -> thread::Result<()> {

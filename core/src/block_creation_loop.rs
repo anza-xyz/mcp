@@ -31,6 +31,7 @@ use {
         bank_forks::BankForks,
         block_component_processor::BlockComponentProcessor,
     },
+    solana_transaction::versioned::VersionedTransaction,
     solana_version::version,
     solana_votor::{
         common::block_timeout,
@@ -439,6 +440,30 @@ fn produce_block_footer(
     }
 }
 
+fn record_with_optional_bankless(
+    poh_recorder: &RwLock<PohRecorder>,
+    slot: Slot,
+    mixins: Vec<Hash>,
+    transaction_batches: Vec<Vec<VersionedTransaction>>,
+) -> Result<(), PohRecorderError> {
+    let mut poh_recorder = poh_recorder.write().unwrap();
+    if poh_recorder.has_bank() {
+        poh_recorder
+            .record(slot, mixins, transaction_batches)
+            .map(|_| ())
+    } else {
+        poh_recorder
+            .record_bankless(
+                // `has_bank() == false` means this slot is using the bankless path.
+                true,
+                slot,
+                mixins,
+                transaction_batches,
+            )
+            .map(|_| ())
+    }
+}
+
 /// Shutdowns the record receiver and drains any remaining records.
 fn shutdown_and_drain_record_receiver(
     poh_recorder: &RwLock<PohRecorder>,
@@ -450,7 +475,8 @@ fn shutdown_and_drain_record_receiver(
         let Ok(record) = record_receiver.recv_timeout(Duration::ZERO) else {
             continue;
         };
-        poh_recorder.write().unwrap().record(
+        record_with_optional_bankless(
+            poh_recorder,
             record.slot,
             record.mixins,
             record.transaction_batches,
@@ -488,7 +514,8 @@ fn record_and_complete_block(
         let Ok(record) = record_receiver.recv_timeout(remaining_slot_time) else {
             continue;
         };
-        poh_recorder.write().unwrap().record(
+        record_with_optional_bankless(
+            poh_recorder,
             record.slot,
             record.mixins,
             record.transaction_batches,

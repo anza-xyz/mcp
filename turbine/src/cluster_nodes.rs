@@ -713,12 +713,7 @@ pub(crate) fn get_data_plane_fanout(shred_slot: Slot, root_bank: &Bank) -> usize
 pub fn check_feature_activation(feature: &Pubkey, shred_slot: Slot, root_bank: &Bank) -> bool {
     match root_bank.feature_set.activated_slot(feature) {
         None => false,
-        Some(feature_slot) => {
-            let epoch_schedule = root_bank.epoch_schedule();
-            let feature_epoch = epoch_schedule.get_epoch(feature_slot);
-            let shred_epoch = epoch_schedule.get_epoch(shred_slot);
-            feature_epoch < shred_epoch
-        }
+        Some(feature_slot) => shred_slot >= feature_slot,
     }
 }
 

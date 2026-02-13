@@ -109,6 +109,8 @@ use {
     solana_measure::{measure::Measure, measure_time, measure_us},
     solana_message::{inner_instruction::InnerInstructions, AccountKeys, SanitizedMessage},
     solana_native_token::LAMPORTS_PER_SOL,
+    solana_nonce as nonce,
+    solana_nonce_account::{get_system_account_kind, SystemAccountKind},
     solana_packet::PACKET_DATA_SIZE,
     solana_precompile_error::PrecompileError,
     solana_program_runtime::{
@@ -188,8 +190,6 @@ use {
     solana_accounts_db::accounts_db::{
         ACCOUNTS_DB_CONFIG_FOR_BENCHMARKS, ACCOUNTS_DB_CONFIG_FOR_TESTING,
     },
-    solana_nonce as nonce,
-    solana_nonce_account::{get_system_account_kind, SystemAccountKind},
     solana_program_runtime::{loaded_programs::ProgramCacheForTxBatch, sysvar_cache::SysvarCache},
 };
 pub use {partitioned_epoch_rewards::KeyedRewardsAndNumPartitions, solana_reward_info::RewardType};
@@ -3220,6 +3220,7 @@ impl Bank {
                     enable_return_data_recording: true,
                     enable_transaction_balance_recording: true,
                 },
+                skip_fee_collection: false,
             },
         );
 
@@ -3465,6 +3466,134 @@ impl Bank {
             processed_counts,
             balance_collector: sanitized_output.balance_collector,
         }
+    }
+
+    /// MCP fee-only pass: validate nonce/fee payer and collect fees without
+    /// executing instructions.
+    pub fn collect_fees_only_for_transactions(
+        &self,
+        batch: &TransactionBatch<impl TransactionWithMeta>,
+        max_age: usize,
+        error_counters: &mut TransactionErrorMetrics,
+    ) -> Vec<Result<FeeDetails>> {
+        let sanitized_txs = batch.sanitized_transactions();
+        let check_results =
+            self.check_transactions(sanitized_txs, batch.lock_results(), max_age, error_counters);
+
+        let (blockhash, blockhash_lamports_per_signature) =
+            self.last_blockhash_and_lamports_per_signature();
+        let processing_environment = TransactionProcessingEnvironment {
+            blockhash,
+            blockhash_lamports_per_signature,
+            epoch_total_stake: self.get_current_epoch_total_stake(),
+            feature_set: self.feature_set.runtime_features(),
+            rent: self.rent_collector.rent.clone(),
+        };
+
+        let mut fee_results = self
+            .transaction_processor
+            .collect_fees_only_sanitized_transactions(
+                self,
+                sanitized_txs,
+                check_results,
+                &processing_environment,
+            );
+        let require_static_nonce_account = self
+            .feature_set
+            .is_active(&feature_set::require_static_nonce_account::id());
+        let nonce_min_balance = self
+            .rent_collector
+            .rent
+            .minimum_balance(nonce::state::State::size());
+
+        // Phase-A semantics: persist fee deductions for every transaction that
+        // passes signature/basic checks, even if execution later fails.
+        for (tx, fee_result) in sanitized_txs.iter().zip(fee_results.iter_mut()) {
+            let Ok(fee_details) = fee_result else {
+                continue;
+            };
+            let is_durable_nonce_tx = tx.get_durable_nonce(require_static_nonce_account).is_some();
+            let mut fee = fee_details.total_fee();
+            if is_durable_nonce_tx {
+                fee = match fee.checked_add(nonce_min_balance) {
+                    Some(fee) => fee,
+                    None => {
+                        *fee_result = Err(TransactionError::InsufficientFundsForFee);
+                        continue;
+                    }
+                };
+            }
+            let withdraw_result = if is_durable_nonce_tx {
+                self.withdraw_for_mcp_phase_a_nonce(tx.fee_payer(), fee)
+            } else {
+                self.withdraw(tx.fee_payer(), fee)
+            };
+            if let Err(err) = withdraw_result {
+                *fee_result = Err(err);
+            }
+        }
+
+        fee_results
+    }
+
+    fn withdraw(&self, pubkey: &Pubkey, lamports: u64) -> Result<()> {
+        match self.get_account_with_fixed_root(pubkey) {
+            Some(mut account) => {
+                let min_balance = match get_system_account_kind(&account) {
+                    Some(SystemAccountKind::Nonce) => self
+                        .rent_collector
+                        .rent
+                        .minimum_balance(nonce::state::State::size()),
+                    _ => 0,
+                };
+
+                lamports
+                    .checked_add(min_balance)
+                    .filter(|required_balance| *required_balance <= account.lamports())
+                    .ok_or(TransactionError::InsufficientFundsForFee)?;
+                account
+                    .checked_sub_lamports(lamports)
+                    .map_err(|_| TransactionError::InsufficientFundsForFee)?;
+                self.store_account(pubkey, &account);
+
+                Ok(())
+            }
+            None => Err(TransactionError::AccountNotFound),
+        }
+    }
+
+    fn withdraw_for_mcp_phase_a_nonce(&self, pubkey: &Pubkey, lamports: u64) -> Result<()> {
+        match self.get_account_with_fixed_root(pubkey) {
+            Some(mut account) => {
+                // Phase-A nonce charging already includes the nonce rent floor in `lamports`.
+                // Avoid re-applying the nonce reserve check from `withdraw()`.
+                account
+                    .checked_sub_lamports(lamports)
+                    .map_err(|_| TransactionError::InsufficientFundsForFee)?;
+                self.store_account(pubkey, &account);
+                Ok(())
+            }
+            None => Err(TransactionError::AccountNotFound),
+        }
+    }
+
+    /// MCP second-pass helper: execute transactions without fee re-deduction.
+    pub fn load_and_execute_transactions_skip_fee_collection(
+        &self,
+        batch: &TransactionBatch<impl TransactionWithMeta>,
+        max_age: usize,
+        timings: &mut ExecuteTimings,
+        error_counters: &mut TransactionErrorMetrics,
+        mut processing_config: TransactionProcessingConfig,
+    ) -> LoadAndExecuteTransactionsOutput {
+        processing_config.skip_fee_collection = true;
+        self.load_and_execute_transactions(
+            batch,
+            max_age,
+            timings,
+            error_counters,
+            processing_config,
+        )
     }
 
     fn collect_logs(
@@ -3888,6 +4017,7 @@ impl Bank {
             timings,
             log_messages_bytes_limit,
             None::<fn(&mut _, &_) -> _>,
+            false,
         )
         .unwrap()
     }
@@ -3911,6 +4041,30 @@ impl Bank {
             timings,
             log_messages_bytes_limit,
             Some(pre_commit_callback),
+            false,
+        )
+    }
+
+    pub fn load_execute_and_commit_transactions_skip_fee_collection_with_pre_commit_callback<'a>(
+        &'a self,
+        batch: &TransactionBatch<impl TransactionWithMeta>,
+        max_age: usize,
+        recording_config: ExecutionRecordingConfig,
+        timings: &mut ExecuteTimings,
+        log_messages_bytes_limit: Option<usize>,
+        pre_commit_callback: impl FnOnce(
+            &mut ExecuteTimings,
+            &[TransactionProcessingResult],
+        ) -> PreCommitResult<'a>,
+    ) -> Result<(Vec<TransactionCommitResult>, Option<BalanceCollector>)> {
+        self.do_load_execute_and_commit_transactions_with_pre_commit_callback(
+            batch,
+            max_age,
+            recording_config,
+            timings,
+            log_messages_bytes_limit,
+            Some(pre_commit_callback),
+            true,
         )
     }
 
@@ -3924,6 +4078,7 @@ impl Bank {
         pre_commit_callback: Option<
             impl FnOnce(&mut ExecuteTimings, &[TransactionProcessingResult]) -> PreCommitResult<'a>,
         >,
+        skip_fee_collection: bool,
     ) -> Result<(Vec<TransactionCommitResult>, Option<BalanceCollector>)> {
         let LoadAndExecuteTransactionsOutput {
             processing_results,
@@ -3940,6 +4095,7 @@ impl Bank {
                 log_messages_bytes_limit,
                 limit_to_load_programs: false,
                 recording_config,
+                skip_fee_collection,
             },
         );
 
@@ -6071,32 +6227,6 @@ impl Bank {
             &mut ExecuteTimings::default(), // Called by ledger-tool, metrics not accumulated.
             reload,
         )
-    }
-
-    pub fn withdraw(&self, pubkey: &Pubkey, lamports: u64) -> Result<()> {
-        match self.get_account_with_fixed_root(pubkey) {
-            Some(mut account) => {
-                let min_balance = match get_system_account_kind(&account) {
-                    Some(SystemAccountKind::Nonce) => self
-                        .rent_collector
-                        .rent
-                        .minimum_balance(nonce::state::State::size()),
-                    _ => 0,
-                };
-
-                lamports
-                    .checked_add(min_balance)
-                    .filter(|required_balance| *required_balance <= account.lamports())
-                    .ok_or(TransactionError::InsufficientFundsForFee)?;
-                account
-                    .checked_sub_lamports(lamports)
-                    .map_err(|_| TransactionError::InsufficientFundsForFee)?;
-                self.store_account(pubkey, &account);
-
-                Ok(())
-            }
-            None => Err(TransactionError::AccountNotFound),
-        }
     }
 
     pub fn set_hash_overrides(&self, hash_overrides: HashOverrides) {
