@@ -20,6 +20,7 @@ use {
     solana_clock::MAX_PROCESSING_AGE,
     solana_measure::measure_us,
     solana_runtime::{bank::Bank, bank_forks::BankForks},
+    solana_runtime_transaction::transaction_meta::StaticMeta,
     solana_svm::transaction_error_metrics::TransactionErrorMetrics,
     std::{
         num::Saturating,
@@ -35,6 +36,7 @@ pub(crate) struct SchedulerController<R, S>
 where
     R: ReceiveAndBuffer,
     S: Scheduler<R::Transaction>,
+    R::Transaction: StaticMeta,
 {
     /// Exit signal for the scheduler thread.
     exit: Arc<AtomicBool>,
@@ -63,6 +65,7 @@ impl<R, S> SchedulerController<R, S>
 where
     R: ReceiveAndBuffer,
     S: Scheduler<R::Transaction>,
+    R::Transaction: StaticMeta,
 {
     pub fn new(
         exit: Arc<AtomicBool>,
@@ -196,15 +199,21 @@ where
             max_age,
             &mut error_counters,
         );
+        let mut mcp_fee_payer_tracker =
+            crate::banking_stage::consumer::McpFeePayerTracker::default();
 
         for ((check_result, tx), result) in check_results
             .into_iter()
             .zip(transactions)
             .zip(results.iter_mut())
         {
-            *result = check_result
-                .and_then(|_| Consumer::check_fee_payer_unlocked(bank, *tx, &mut error_counters))
-                .is_ok();
+            let fee_check_result = Consumer::check_fee_payer_unlocked_admission(
+                bank,
+                *tx,
+                &mut mcp_fee_payer_tracker,
+                &mut error_counters,
+            );
+            *result = check_result.and_then(|_| fee_check_result).is_ok();
         }
     }
 

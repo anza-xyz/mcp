@@ -129,6 +129,7 @@ impl BroadcastStageType {
         votor_event_sender: VotorEventSender,
         migration_status: Arc<MigrationStatus>,
     ) -> BroadcastStage {
+        let identity = cluster_info.id();
         match self {
             BroadcastStageType::Standard => BroadcastStage::new(
                 sock,
@@ -140,7 +141,7 @@ impl BroadcastStageType {
                 bank_forks,
                 quic_endpoint_sender,
                 votor_event_sender.clone(),
-                StandardBroadcastRun::new(shred_version, migration_status),
+                StandardBroadcastRun::new(identity, shred_version, migration_status),
                 xdp_sender,
             ),
 
@@ -789,7 +790,11 @@ pub mod test {
             bank_forks,
             quic_endpoint_sender,
             votor_event_sender,
-            StandardBroadcastRun::new(0, Arc::new(MigrationStatus::default())),
+            StandardBroadcastRun::new(
+                *leader_info.info.pubkey(),
+                0,
+                Arc::new(MigrationStatus::default()),
+            ),
             None,
         );
 

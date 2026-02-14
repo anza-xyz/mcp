@@ -1898,6 +1898,10 @@ impl Validator {
         self.join();
     }
 
+    pub fn mcp_consensus_block_bytes(&self, slot: Slot) -> Option<Vec<u8>> {
+        self.tvu.mcp_consensus_block_bytes(slot)
+    }
+
     fn print_node_info(node: &Node) {
         info!("{:?}", node.info);
         info!(

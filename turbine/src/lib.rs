@@ -4,6 +4,9 @@
 mod addr_cache;
 
 #[cfg(feature = "agave-unstable-api")]
+mod mcp_proposer;
+
+#[cfg(feature = "agave-unstable-api")]
 pub mod broadcast_stage;
 
 #[cfg(feature = "agave-unstable-api")]

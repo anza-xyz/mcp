@@ -236,6 +236,16 @@ pub trait AdminRpc {
         shred_index: u64,
     ) -> Result<()>;
 
+    #[rpc(meta, name = "repairMcpShredFromPeer")]
+    fn repair_mcp_shred_from_peer(
+        &self,
+        meta: Self::Metadata,
+        pubkey: Option<Pubkey>,
+        slot: u64,
+        proposer_index: u32,
+        shred_index: u32,
+    ) -> Result<()>;
+
     #[rpc(meta, name = "repairWhitelist")]
     fn repair_whitelist(&self, meta: Self::Metadata) -> Result<AdminRpcRepairWhitelist>;
 
@@ -592,6 +602,31 @@ impl AdminRpc for AdminRpcImpl {
                 post_init.cluster_slots.clone(),
                 pubkey,
                 slot,
+                shred_index,
+                &post_init.repair_socket.clone(),
+                post_init.outstanding_repair_requests.clone(),
+            );
+            Ok(())
+        })
+    }
+
+    fn repair_mcp_shred_from_peer(
+        &self,
+        meta: Self::Metadata,
+        pubkey: Option<Pubkey>,
+        slot: u64,
+        proposer_index: u32,
+        shred_index: u32,
+    ) -> Result<()> {
+        debug!("repair_mcp_shred_from_peer request received");
+
+        meta.with_post_init(|post_init| {
+            repair_service::RepairService::request_repair_for_mcp_shred_from_peer(
+                post_init.cluster_info.clone(),
+                post_init.cluster_slots.clone(),
+                pubkey,
+                slot,
+                proposer_index,
                 shred_index,
                 &post_init.repair_socket.clone(),
                 post_init.outstanding_repair_requests.clone(),

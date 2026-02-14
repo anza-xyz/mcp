@@ -193,6 +193,7 @@ impl AncestorHashesService {
                         PacketFlags::REPAIR,
                         response_sender,
                         exit,
+                        None,
                     )
                 })
                 .unwrap()

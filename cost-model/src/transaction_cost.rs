@@ -280,6 +280,10 @@ impl solana_runtime_transaction::transaction_meta::StaticMeta for WritableKeysTr
     fn instruction_data_len(&self) -> u16 {
         unimplemented!("WritableKeysTransaction::instruction_data_len")
     }
+
+    fn mcp_fee_components(&self) -> Option<(u64, u64)> {
+        None
+    }
 }
 
 #[cfg(feature = "dev-context-only-utils")]

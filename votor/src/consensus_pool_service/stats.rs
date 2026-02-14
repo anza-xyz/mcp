@@ -16,6 +16,8 @@ pub(crate) struct ConsensusPoolServiceStats {
     pub(crate) new_finalized_slot: Saturating<usize>,
     pub(crate) parent_ready_missed_window: Saturating<usize>,
     pub(crate) parent_ready_produce_window: Saturating<usize>,
+    pub(crate) parent_ready_leader_lookup_failed: Saturating<usize>,
+    pub(crate) parent_ready_leader_lookup_exit: Saturating<usize>,
     pub(crate) received_votes: Saturating<usize>,
     pub(crate) received_certificates: Saturating<usize>,
     pub(crate) standstill: bool,
@@ -32,6 +34,8 @@ impl ConsensusPoolServiceStats {
             new_finalized_slot: Saturating(0),
             parent_ready_missed_window: Saturating(0),
             parent_ready_produce_window: Saturating(0),
+            parent_ready_leader_lookup_failed: Saturating(0),
+            parent_ready_leader_lookup_exit: Saturating(0),
             received_votes: Saturating(0),
             received_certificates: Saturating(0),
             standstill: false,
@@ -48,6 +52,8 @@ impl ConsensusPoolServiceStats {
             new_finalized_slot: Saturating(new_finalized_slot),
             parent_ready_missed_window: Saturating(parent_ready_missed_window),
             parent_ready_produce_window: Saturating(parent_ready_produce_window),
+            parent_ready_leader_lookup_failed: Saturating(parent_ready_leader_lookup_failed),
+            parent_ready_leader_lookup_exit: Saturating(parent_ready_leader_lookup_exit),
             received_votes: Saturating(received_votes),
             received_certificates: Saturating(received_certificates),
             standstill,
@@ -68,6 +74,16 @@ impl ConsensusPoolServiceStats {
             (
                 "parent_ready_produce_window",
                 parent_ready_produce_window,
+                i64
+            ),
+            (
+                "parent_ready_leader_lookup_failed",
+                parent_ready_leader_lookup_failed,
+                i64
+            ),
+            (
+                "parent_ready_leader_lookup_exit",
+                parent_ready_leader_lookup_exit,
                 i64
             ),
             ("received_votes", received_votes, i64),

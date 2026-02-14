@@ -225,10 +225,14 @@ pub fn generate_vote_tx(
         );
     }
     let vote_serialized = bincode::serialize(&vote).unwrap();
-    let rank_map = bank
-        .epoch_stakes_from_slot(vote.slot())
-        .unwrap_or_else(|| panic!("could not find epoch stakes for slot {}", vote.slot()))
-        .bls_pubkey_to_rank_map();
+    let Some(epoch_stakes) = bank.epoch_stakes_from_slot(vote.slot()) else {
+        info!(
+            "unable to load epoch stakes for vote slot {}; skipping vote",
+            vote.slot()
+        );
+        return GenerateVoteTxResult::NoRankFound;
+    };
+    let rank_map = epoch_stakes.bls_pubkey_to_rank_map();
     let Some(my_rank) = rank_map.get_rank(&my_bls_pubkey) else {
         return GenerateVoteTxResult::NoRankFound;
     };
@@ -259,7 +263,16 @@ fn insert_vote_and_create_bls_message(
         context.vote_history.add_vote(vote);
     }
 
-    let bank = context.sharable_banks.root();
+    let bank_pair = context.sharable_banks.load();
+    let bank = if bank_pair
+        .working_bank
+        .epoch_stakes_from_slot(vote.slot())
+        .is_some()
+    {
+        bank_pair.working_bank
+    } else {
+        bank_pair.root_bank
+    };
     let message = match generate_vote_tx(
         &vote,
         &bank,
@@ -562,8 +575,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "could not find epoch stakes for slot 1000000000")]
-    fn test_panic_on_future_slot() {
+    fn test_future_slot_returns_none() {
         agave_logger::setup();
         let (own_vote_sender, _own_vote_receiver) = crossbeam_channel::unbounded();
         // Create 10 node validatorvotekeypairs vec
@@ -574,9 +586,12 @@ mod tests {
         let mut voting_context =
             setup_voting_context_and_bank_forks(own_vote_sender, &validator_keypairs, my_index);
 
-        // If we try to vote for a slot in the future, we should panic
+        // If we try to vote for a slot in the future, this is a transient
+        // condition and vote generation should be skipped.
         let vote = Vote::new_notarization_vote(1_000_000_000, Hash::new_unique());
-        let _ = generate_vote_message(vote, false, &mut voting_context);
+        assert!(generate_vote_message(vote, false, &mut voting_context)
+            .unwrap()
+            .is_none());
     }
 
     #[test]

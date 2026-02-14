@@ -22,6 +22,7 @@ use {
     percentage::Percentage,
     solana_account::{state_traits::StateMut, AccountSharedData, ReadableAccount, PROGRAM_OWNERS},
     solana_clock::{Epoch, Slot},
+    solana_fee_structure::FeeDetails,
     solana_hash::Hash,
     solana_instruction::TRANSACTION_LEVEL_STACK_HEIGHT,
     solana_message::{
@@ -117,6 +118,9 @@ pub struct TransactionProcessingConfig<'a> {
     pub limit_to_load_programs: bool,
     /// Recording capabilities for transaction execution.
     pub recording_config: ExecutionRecordingConfig,
+    /// If true, execution skips fee payer deduction while still computing
+    /// fee_details for deterministic reporting in MCP second-pass replay.
+    pub skip_fee_collection: bool,
 }
 
 /// Runtime environment for transaction batch processing.
@@ -410,6 +414,7 @@ impl<FG: ForkGraph> TransactionBatchProcessor<FG> {
                         &environment.blockhash,
                         &environment.rent,
                         &mut error_metrics,
+                        config.skip_fee_collection,
                     )
                 }));
             execute_timings
@@ -547,6 +552,44 @@ impl<FG: ForkGraph> TransactionBatchProcessor<FG> {
         }
     }
 
+    pub fn collect_fees_only_sanitized_transactions<CB: TransactionProcessingCallback>(
+        &self,
+        callbacks: &CB,
+        sanitized_txs: &[impl SVMTransaction],
+        check_results: Vec<TransactionCheckResult>,
+        environment: &TransactionProcessingEnvironment,
+    ) -> Vec<TransactionResult<FeeDetails>> {
+        debug_assert_eq!(sanitized_txs.len(), check_results.len());
+
+        let account_keys_in_batch = sanitized_txs.iter().map(|tx| tx.account_keys().len()).sum();
+        let mut account_loader = AccountLoader::new_with_loaded_accounts_capacity(
+            None,
+            callbacks,
+            &environment.feature_set,
+            account_keys_in_batch,
+        );
+        let mut error_metrics = TransactionErrorMetrics::default();
+
+        sanitized_txs
+            .iter()
+            .zip(check_results)
+            .map(|(tx, check_result)| {
+                check_result.and_then(|tx_details| {
+                    Self::validate_transaction_nonce_and_fee_payer(
+                        &mut account_loader,
+                        tx,
+                        tx_details,
+                        &environment.blockhash,
+                        &environment.rent,
+                        &mut error_metrics,
+                        false, // this pass performs fee collection
+                    )
+                    .map(|details| details.fee_details)
+                })
+            })
+            .collect()
+    }
+
     fn validate_transaction_nonce_and_fee_payer<CB: TransactionProcessingCallback>(
         account_loader: &mut AccountLoader<CB>,
         message: &impl SVMMessage,
@@ -554,6 +597,7 @@ impl<FG: ForkGraph> TransactionBatchProcessor<FG> {
         environment_blockhash: &Hash,
         rent: &Rent,
         error_counters: &mut TransactionErrorMetrics,
+        skip_fee_collection: bool,
     ) -> TransactionResult<ValidatedTransactionDetails> {
         // If this is a nonce transaction, validate the nonce info.
         // This must be done for every transaction to support SIMD83 because
@@ -581,6 +625,7 @@ impl<FG: ForkGraph> TransactionBatchProcessor<FG> {
             checked_details,
             rent,
             error_counters,
+            skip_fee_collection,
         )
     }
 
@@ -593,6 +638,7 @@ impl<FG: ForkGraph> TransactionBatchProcessor<FG> {
         checked_details: CheckedTransactionDetails,
         rent: &Rent,
         error_counters: &mut TransactionErrorMetrics,
+        skip_fee_collection: bool,
     ) -> TransactionResult<ValidatedTransactionDetails> {
         let CheckedTransactionDetails {
             nonce,
@@ -619,13 +665,18 @@ impl<FG: ForkGraph> TransactionBatchProcessor<FG> {
         update_rent_exempt_status_for_account(rent, &mut loaded_fee_payer.account);
 
         let fee_payer_index = 0;
+        let required_fee = if skip_fee_collection {
+            0
+        } else {
+            compute_budget_and_limits.fee_details.total_fee()
+        };
         validate_fee_payer(
             fee_payer_address,
             &mut loaded_fee_payer.account,
             fee_payer_index,
             error_counters,
             rent,
-            compute_budget_and_limits.fee_details.total_fee(),
+            required_fee,
         )?;
 
         // Capture fee-subtracted fee payer account and next nonce account state
@@ -1967,6 +2018,7 @@ mod tests {
                 &Hash::default(),
                 &rent,
                 &mut error_counters,
+                false,
             );
 
         let post_validation_fee_payer_account = {
@@ -2046,6 +2098,7 @@ mod tests {
                 &Hash::default(),
                 &rent,
                 &mut error_counters,
+                false,
             );
 
         let post_validation_fee_payer_account = {
@@ -2082,6 +2135,135 @@ mod tests {
     }
 
     #[test]
+    fn test_validate_transaction_fee_payer_skip_fee_collection() {
+        let lamports_per_signature = 5_000;
+        let message = new_unchecked_sanitized_message(Message::new_with_blockhash(
+            &[],
+            Some(&Pubkey::new_unique()),
+            &Hash::new_unique(),
+        ));
+        let fee_payer_address = message.fee_payer();
+        let starting_balance = lamports_per_signature + 100;
+        let fee_payer_account = AccountSharedData::new(starting_balance, 0, &Pubkey::default());
+
+        let mut mock_accounts = HashMap::new();
+        mock_accounts.insert(*fee_payer_address, fee_payer_account.clone());
+        let mock_bank = MockBankCallback {
+            account_shared_data: Arc::new(RwLock::new(mock_accounts)),
+            ..Default::default()
+        };
+        let mut account_loader = (&mock_bank).into();
+
+        let mut error_counters = TransactionErrorMetrics::default();
+        let compute_budget_and_limits = SVMTransactionExecutionAndFeeBudgetLimits::with_fee(
+            MockBankCallback::calculate_fee_details(&message, lamports_per_signature, 0),
+        );
+        let result =
+            TransactionBatchProcessor::<TestForkGraph>::validate_transaction_nonce_and_fee_payer(
+                &mut account_loader,
+                &message,
+                CheckedTransactionDetails::new(None, Ok(compute_budget_and_limits)),
+                &Hash::default(),
+                &Rent::default(),
+                &mut error_counters,
+                true,
+            )
+            .unwrap();
+
+        assert_eq!(
+            result.fee_details,
+            MockBankCallback::calculate_fee_details(&message, lamports_per_signature, 0),
+        );
+        assert_eq!(
+            result.loaded_fee_payer_account.account.lamports(),
+            starting_balance
+        );
+    }
+
+    #[test]
+    fn test_validate_transaction_fee_payer_skip_fee_collection_still_validates_payer() {
+        let lamports_per_signature = 5_000;
+        let message = new_unchecked_sanitized_message(Message::new_with_blockhash(
+            &[],
+            Some(&Pubkey::new_unique()),
+            &Hash::new_unique(),
+        ));
+        let fee_payer_address = message.fee_payer();
+        let fee_payer_account = AccountSharedData::new(0, 0, &Pubkey::default());
+
+        let mut mock_accounts = HashMap::new();
+        mock_accounts.insert(*fee_payer_address, fee_payer_account);
+        let mock_bank = MockBankCallback {
+            account_shared_data: Arc::new(RwLock::new(mock_accounts)),
+            ..Default::default()
+        };
+        let mut account_loader = (&mock_bank).into();
+
+        let mut error_counters = TransactionErrorMetrics::default();
+        let compute_budget_and_limits = SVMTransactionExecutionAndFeeBudgetLimits::with_fee(
+            MockBankCallback::calculate_fee_details(&message, lamports_per_signature, 0),
+        );
+        let result =
+            TransactionBatchProcessor::<TestForkGraph>::validate_transaction_nonce_and_fee_payer(
+                &mut account_loader,
+                &message,
+                CheckedTransactionDetails::new(None, Ok(compute_budget_and_limits)),
+                &Hash::default(),
+                &Rent::default(),
+                &mut error_counters,
+                true,
+            );
+
+        assert_eq!(result, Err(TransactionError::AccountNotFound));
+    }
+
+    #[test]
+    fn test_collect_fees_only_sanitized_transactions() {
+        let lamports_per_signature = 5_000;
+        let message = new_unchecked_sanitized_message(Message::new_with_blockhash(
+            &[],
+            Some(&Pubkey::new_unique()),
+            &Hash::new_unique(),
+        ));
+        let fee_payer_address = message.fee_payer();
+        let fee_payer_account =
+            AccountSharedData::new(lamports_per_signature + 10, 0, &Pubkey::default());
+        let sanitized_tx = SanitizedTransaction::new_for_tests(
+            message.clone(),
+            vec![Signature::new_unique()],
+            false,
+        );
+
+        let mut mock_accounts = HashMap::new();
+        mock_accounts.insert(*fee_payer_address, fee_payer_account);
+        let mock_bank = MockBankCallback {
+            account_shared_data: Arc::new(RwLock::new(mock_accounts)),
+            ..Default::default()
+        };
+
+        let fee_details =
+            MockBankCallback::calculate_fee_details(&message, lamports_per_signature, 0);
+        let check_results = vec![Ok(CheckedTransactionDetails::new(
+            None,
+            Ok(SVMTransactionExecutionAndFeeBudgetLimits::with_fee(
+                fee_details,
+            )),
+        ))];
+
+        let processor = TransactionBatchProcessor::<TestForkGraph>::default();
+        let results = processor.collect_fees_only_sanitized_transactions(
+            &mock_bank,
+            &[sanitized_tx],
+            check_results,
+            &TransactionProcessingEnvironment::default(),
+        );
+        assert_eq!(
+            results,
+            vec![Ok(FeeDetails::new(lamports_per_signature, 0))]
+        );
+    }
+
+    #[test]
     fn test_validate_transaction_fee_payer_not_found() {
         let message =
             new_unchecked_sanitized_message(Message::new(&[], Some(&Pubkey::new_unique())));
@@ -2100,6 +2282,7 @@ mod tests {
                 &Hash::default(),
                 &Rent::default(),
                 &mut error_counters,
+                false,
             );
 
         assert_eq!(error_counters.account_not_found.0, 1);
@@ -2139,6 +2322,7 @@ mod tests {
                 &Hash::default(),
                 &Rent::default(),
                 &mut error_counters,
+                false,
             );
 
         assert_eq!(error_counters.insufficient_funds.0, 1);
@@ -2182,6 +2366,7 @@ mod tests {
                 &Hash::default(),
                 &rent,
                 &mut error_counters,
+                false,
             );
 
         assert_eq!(
@@ -2223,6 +2408,7 @@ mod tests {
                 &Hash::default(),
                 &Rent::default(),
                 &mut error_counters,
+                false,
             );
 
         assert_eq!(error_counters.invalid_account_for_fee.0, 1);
@@ -2250,6 +2436,7 @@ mod tests {
                 &Hash::default(),
                 &Rent::default(),
                 &mut error_counters,
+                false,
             );
 
         assert_eq!(error_counters.invalid_compute_budget.0, 1);
@@ -2326,6 +2513,7 @@ mod tests {
                    &environment_blockhash,
                    &rent,
                    &mut error_counters,
+               false,
                );
 
             let post_validation_fee_payer_account = {
@@ -2389,6 +2577,7 @@ mod tests {
                 &Hash::default(),
                 &rent,
                 &mut error_counters,
+               false,
                );
 
             assert_eq!(error_counters.insufficient_funds.0, 1);
@@ -2435,6 +2624,7 @@ mod tests {
             &Hash::default(),
             &Rent::default(),
             &mut TransactionErrorMetrics::default(),
+            false,
         )
         .unwrap();
 

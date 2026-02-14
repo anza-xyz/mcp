@@ -48,4 +48,19 @@ impl RepairHandler for StandardRepairHandler {
             }
         }
     }
+
+    fn repair_response_packet_mcp(
+        &self,
+        slot: Slot,
+        proposer_index: u32,
+        shred_index: u32,
+        dest: &SocketAddr,
+        _nonce: Nonce,
+    ) -> Option<Packet> {
+        let shred = self
+            .blockstore()
+            .get_mcp_shred_data(slot, proposer_index, shred_index)
+            .expect("Blockstore could not get MCP shred data")?;
+        repair_response::repair_response_packet_from_bytes_with_optional_nonce(shred, dest, None)
+    }
 }

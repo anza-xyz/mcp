@@ -214,7 +214,9 @@ impl ParentReadyTracker {
         match self
             .slot_statuses
             .get(&slot)
-            .and_then(|ss| ss.parents_ready.iter().min().copied())
+            // Use the most recent parent-ready block so production builds on the newest
+            // certified chain tip instead of pinning to the oldest eligible ancestor.
+            .and_then(|ss| ss.parents_ready.iter().max().copied())
         {
             Some(parent) => BlockProductionParent::Parent(parent),
             // TODO: this will be plugged in for optimistic block production
@@ -406,9 +408,9 @@ mod tests {
             .sorted()
             .collect();
         assert_eq!(parent_readys, (0..=10).collect::<Vec<Slot>>());
-        assert_eq!(
+        assert!(matches!(
             tracker.block_production_parent(12),
-            BlockProductionParent::Parent(genesis)
-        );
+            BlockProductionParent::Parent((10, _))
+        ));
     }
 }

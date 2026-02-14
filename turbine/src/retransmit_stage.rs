@@ -15,7 +15,11 @@ use {
     solana_gossip::{cluster_info::ClusterInfo, contact_info::Protocol},
     solana_ledger::{
         leader_schedule_cache::LeaderScheduleCache,
-        shred::{self, ShredFlags, ShredId, ShredType},
+        shred::{
+            self,
+            mcp_shred::{is_mcp_shred_bytes, McpShred, MCP_NUM_RELAYS},
+            ShredFlags, ShredId, ShredType,
+        },
     },
     solana_measure::measure::Measure,
     solana_perf::deduper::Deduper,
@@ -364,7 +368,7 @@ fn retransmit(
     let cache: HashMap<Slot, _> = shred_buf
         .iter()
         .flatten()
-        .filter_map(|shred| shred::layout::get_slot(shred))
+        .filter_map(|shred| shred::layout::get_slot(shred).or_else(|| get_mcp_slot(shred)))
         .collect::<HashSet<Slot>>()
         .into_iter()
         .filter_map(|slot: Slot| {
@@ -460,7 +464,8 @@ fn retransmit_shred(
     quic_endpoint_sender: &AsyncSender<(SocketAddr, Bytes)>,
     stats: &RetransmitStats,
 ) -> Option<RetransmitShredOutput> {
-    let key = shred::layout::get_shred_id(shred.as_ref())?;
+    let key =
+        shred::layout::get_shred_id(shred.as_ref()).or_else(|| get_mcp_shred_id(shred.as_ref()))?;
     if key.slot() < root_bank.slot()
         || shred_deduper.dedup(key, shred.as_ref(), MAX_DUPLICATE_COUNT)
     {
@@ -534,6 +539,25 @@ fn retransmit_shred(
             Cow::Borrowed(_) => None,
         },
     })
+}
+
+fn get_mcp_slot(shred: &[u8]) -> Option<Slot> {
+    if !is_mcp_shred_bytes(shred) {
+        return None;
+    }
+    Some(McpShred::from_bytes(shred).ok()?.slot)
+}
+
+fn get_mcp_shred_id(shred: &[u8]) -> Option<ShredId> {
+    if !is_mcp_shred_bytes(shred) {
+        return None;
+    }
+    let mcp_shred = McpShred::from_bytes(shred).ok()?;
+    let packed_index = mcp_shred
+        .proposer_index
+        .checked_mul(u32::try_from(MCP_NUM_RELAYS).ok()?)?
+        .checked_add(mcp_shred.shred_index)?;
+    Some(ShredId::new(mcp_shred.slot, packed_index, ShredType::Data))
 }
 
 fn get_retransmit_addrs<'a>(
@@ -932,7 +956,11 @@ mod tests {
         solana_entry::entry::create_ticks,
         solana_hash::Hash,
         solana_keypair::Keypair,
-        solana_ledger::shred::{ProcessShredsStats, ReedSolomonCache, Shredder},
+        solana_ledger::shred::{
+            mcp_shred::{McpShred, MCP_SHRED_DATA_BYTES, MCP_WITNESS_LEN},
+            ProcessShredsStats, ReedSolomonCache, Shredder,
+        },
+        solana_signature::Signature,
     };
 
     fn get_keypair() -> Keypair {
@@ -1079,5 +1107,27 @@ mod tests {
            First time seeing shred Y w/ changed header (FEC Set index 3)=>Dup because common \
              header is unique but shred ID seen twice already"
         );
+    }
+
+    #[test]
+    fn test_mcp_shred_id_includes_proposer_index() {
+        let make_mcp_shred = |proposer_index: u32| McpShred {
+            slot: 42,
+            proposer_index,
+            shred_index: 7,
+            commitment: [3u8; 32],
+            shred_data: [9u8; MCP_SHRED_DATA_BYTES],
+            witness: [[0u8; 32]; MCP_WITNESS_LEN],
+            proposer_signature: Signature::default(),
+        };
+
+        let shred_a = make_mcp_shred(0).to_bytes();
+        let shred_b = make_mcp_shred(1).to_bytes();
+        let id_a = get_mcp_shred_id(&shred_a).unwrap();
+        let id_b = get_mcp_shred_id(&shred_b).unwrap();
+
+        assert_eq!(id_a.slot(), 42);
+        assert_eq!(id_b.slot(), 42);
+        assert_ne!(id_a.index(), id_b.index());
     }
 }

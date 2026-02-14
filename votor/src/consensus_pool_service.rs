@@ -200,6 +200,7 @@ impl ConsensusPoolService {
         info!("{}: Certificate pool loop starting", &my_pubkey);
         let mut stats = ConsensusPoolServiceStats::new();
         let mut highest_parent_ready = root_bank.slot();
+        let mut consecutive_leader_lookup_failures = 0usize;
 
         // Standstill tracking
         let mut standstill_timer = Instant::now();
@@ -240,6 +241,7 @@ impl ConsensusPoolService {
 
             Self::add_produce_block_event(
                 &mut highest_parent_ready,
+                &mut consecutive_leader_lookup_failures,
                 &consensus_pool,
                 &my_pubkey,
                 &mut ctx,
@@ -346,6 +348,7 @@ impl ConsensusPoolService {
 
     fn add_produce_block_event(
         highest_parent_ready: &mut Slot,
+        consecutive_leader_lookup_failures: &mut usize,
         consensus_pool: &ConsensusPool,
         my_pubkey: &Pubkey,
         ctx: &mut ConsensusPoolContext,
@@ -367,20 +370,40 @@ impl ConsensusPoolService {
         if new_highest_parent_ready <= *highest_parent_ready {
             return;
         }
-        *highest_parent_ready = new_highest_parent_ready;
-
         let root_bank = ctx.sharable_banks.root();
+        let working_bank = ctx.sharable_banks.working();
         let Some(leader_pubkey) = ctx
             .leader_schedule_cache
-            .slot_leader_at(*highest_parent_ready, Some(&root_bank))
+            .slot_leader_at(new_highest_parent_ready, Some(&working_bank))
+            .or_else(|| {
+                ctx.leader_schedule_cache
+                    .slot_leader_at(new_highest_parent_ready, Some(&root_bank))
+            })
+            .or_else(|| {
+                ctx.leader_schedule_cache
+                    .slot_leader_at(new_highest_parent_ready, None)
+            })
         else {
-            error!(
-                "Unable to compute the leader at slot {highest_parent_ready}. Something is wrong, \
-                 exiting"
+            stats.parent_ready_leader_lookup_failed += 1;
+            *consecutive_leader_lookup_failures =
+                consecutive_leader_lookup_failures.saturating_add(1);
+            const MAX_CONSECUTIVE_LEADER_LOOKUP_FAILURES: usize = 32;
+            warn!(
+                "unable to compute leader for parent-ready slot {}; consecutive failures={}",
+                new_highest_parent_ready, *consecutive_leader_lookup_failures
             );
-            ctx.exit.store(true, Ordering::Relaxed);
+            if *consecutive_leader_lookup_failures >= MAX_CONSECUTIVE_LEADER_LOOKUP_FAILURES {
+                error!(
+                    "exiting after {} consecutive parent-ready leader lookup failures at slot {}",
+                    *consecutive_leader_lookup_failures, new_highest_parent_ready
+                );
+                stats.parent_ready_leader_lookup_exit += 1;
+                ctx.exit.store(true, Ordering::Relaxed);
+            }
             return;
         };
+        *consecutive_leader_lookup_failures = 0;
+        *highest_parent_ready = new_highest_parent_ready;
 
         if &leader_pubkey != my_pubkey {
             return;

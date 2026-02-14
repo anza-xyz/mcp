@@ -18,6 +18,7 @@ use {
             },
         },
     },
+    agave_feature_set as feature_set,
     bytes::Bytes,
     crossbeam_channel::{Receiver as CrossbeamReceiver, Sender as CrossbeamSender},
     lru::LruCache,
@@ -30,6 +31,8 @@ use {
     solana_ledger::{
         block_location_lookup::BlockLocationLookup,
         blockstore::{Blockstore, SlotMeta},
+        mcp,
+        mcp_relay_attestation::RelayAttestation,
         shred,
     },
     solana_measure::measure::Measure,
@@ -68,6 +71,8 @@ const DEFER_REPAIR_THRESHOLD_TICKS: u64 = DEFER_REPAIR_THRESHOLD.as_millis() as 
 // before making another request. Value is based on reasonable upper bound of
 // expected network delays in requesting repairs and receiving shreds.
 const REPAIR_REQUEST_TIMEOUT_MS: u64 = 150;
+const MCP_REPAIR_SCAN_INTERVAL: Duration = Duration::from_millis(200);
+const MAX_MCP_REPAIR_SCAN_SLOTS: usize = 64;
 
 // When requesting repair for a specific shred through the admin RPC, we will
 // request up to NUM_PEERS_TO_SAMPLE_FOR_REPAIRS in the event a specific, valid
@@ -160,6 +165,7 @@ impl RepairMetrics {
 #[derive(Default, Debug)]
 pub struct RepairStats {
     pub shred: RepairStatsGroup,
+    pub mcp_shred: RepairStatsGroup,
     pub highest_shred: RepairStatsGroup,
     pub orphan: RepairStatsGroup,
     pub shred_for_block_id: RepairStatsGroup,
@@ -170,6 +176,7 @@ pub struct RepairStats {
 impl RepairStats {
     fn report(&self) {
         let repair_total = self.shred.count
+            + self.mcp_shred.count
             + self.highest_shred.count
             + self.orphan.count
             + self.shred_for_block_id.count;
@@ -177,6 +184,7 @@ impl RepairStats {
             .shred
             .slot_pubkeys
             .iter()
+            .chain(self.mcp_shred.slot_pubkeys.iter())
             .chain(self.highest_shred.slot_pubkeys.iter())
             .chain(self.orphan.slot_pubkeys.iter())
             .chain(self.shred_for_block_id.slot_pubkeys.iter())
@@ -189,6 +197,7 @@ impl RepairStats {
                 "repair_service-my_requests",
                 ("repair-total", repair_total, i64),
                 ("shred-count", self.shred.count, i64),
+                ("mcp-shred-count", self.mcp_shred.count, i64),
                 ("highest-shred-count", self.highest_shred.count, i64),
                 ("orphan-count", self.orphan.count, i64),
                 ("shred-for-block-id-count", self.shred_for_block_id.count, i64),
@@ -437,6 +446,7 @@ struct RepairTracker {
     popular_pruned_forks_requests: HashSet<Slot>,
     // Maps a repair that may still be outstanding to the timestamp it was requested.
     outstanding_repairs: HashMap<ShredRepairType, u64>,
+    last_mcp_repair_scan: Instant,
 }
 
 pub struct RepairService {
@@ -602,6 +612,113 @@ impl RepairService {
         }
     }
 
+    fn identify_mcp_repairs(
+        blockstore: &Blockstore,
+        root_bank: &Bank,
+        max_new_repairs: usize,
+        outstanding_repairs: &mut HashMap<ShredRepairType, u64>,
+    ) -> Vec<ShredRepairType> {
+        if max_new_repairs == 0 {
+            return Vec::new();
+        }
+
+        let Some(mcp_activated_slot) = root_bank
+            .feature_set
+            .activated_slot(&feature_set::mcp_protocol_v1::id())
+        else {
+            return Vec::new();
+        };
+
+        let recent_slots =
+            match blockstore.latest_mcp_relay_attestation_slots(MAX_MCP_REPAIR_SCAN_SLOTS) {
+                Ok(slots) => slots,
+                Err(err) => {
+                    debug!("failed to scan latest MCP relay attestation slots: {err}");
+                    return Vec::new();
+                }
+            };
+
+        let mut repairs = Vec::new();
+        for slot in recent_slots {
+            if repairs.len() >= max_new_repairs {
+                break;
+            }
+            if slot <= root_bank.slot() || slot < mcp_activated_slot {
+                continue;
+            }
+
+            match blockstore.get_mcp_execution_output(slot) {
+                Ok(Some(output)) if !output.is_empty() => continue,
+                Ok(_) => {}
+                Err(err) => {
+                    debug!("failed to read MCP execution output for slot {slot}: {err}");
+                    continue;
+                }
+            }
+
+            let attestations = match blockstore.get_mcp_relay_attestations_for_slot(slot) {
+                Ok(attestations) => attestations,
+                Err(err) => {
+                    debug!("failed to read MCP relay attestations for slot {slot}: {err}");
+                    continue;
+                }
+            };
+            if attestations.is_empty() {
+                continue;
+            }
+
+            let mut proposer_indices = HashSet::new();
+            for (relay_index, bytes) in attestations {
+                let Ok(attestation) = RelayAttestation::from_wire_bytes(&bytes) else {
+                    continue;
+                };
+                if attestation.slot != slot || attestation.relay_index != relay_index {
+                    continue;
+                }
+                proposer_indices
+                    .extend(attestation.entries.iter().map(|entry| entry.proposer_index));
+            }
+            if proposer_indices.is_empty() {
+                continue;
+            }
+
+            for proposer_index in proposer_indices {
+                if repairs.len() >= max_new_repairs {
+                    break;
+                }
+                for shred_index in 0..mcp::NUM_RELAYS as u32 {
+                    match blockstore.get_mcp_shred_data(slot, proposer_index, shred_index) {
+                        Ok(Some(_)) => continue,
+                        Ok(None) => {
+                            if let Some(repair_request) = Self::request_repair_if_needed(
+                                outstanding_repairs,
+                                ShredRepairType::McpShred {
+                                    slot,
+                                    proposer_index,
+                                    shred_index,
+                                },
+                            ) {
+                                repairs.push(repair_request);
+                            }
+                            if repairs.len() >= max_new_repairs {
+                                break;
+                            }
+                            continue;
+                        }
+                        Err(err) => {
+                            debug!(
+                                "failed to read MCP shred for slot {slot}, proposer {proposer_index}, shred {shred_index}: {err}"
+                            );
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        repairs
+    }
+
     fn handle_popular_pruned_forks(
         root_bank: Arc<Bank>,
         repair_weight: &mut RepairWeight,
@@ -713,6 +830,7 @@ impl RepairService {
             peers_cache,
             popular_pruned_forks_requests,
             outstanding_repairs,
+            last_mcp_repair_scan,
         } = repair_tracker;
         let root_bank = sharable_banks.root();
 
@@ -726,7 +844,7 @@ impl RepairService {
             repair_metrics,
         );
 
-        let repairs = Self::identify_repairs(
+        let mut repairs = Self::identify_repairs(
             blockstore,
             root_bank.clone(),
             repair_info,
@@ -734,6 +852,17 @@ impl RepairService {
             outstanding_repairs,
             repair_metrics,
         );
+        if repairs.len() < MAX_REPAIR_LENGTH
+            && last_mcp_repair_scan.elapsed() >= MCP_REPAIR_SCAN_INTERVAL
+        {
+            *last_mcp_repair_scan = Instant::now();
+            repairs.extend(Self::identify_mcp_repairs(
+                blockstore,
+                root_bank.as_ref(),
+                MAX_REPAIR_LENGTH.saturating_sub(repairs.len()),
+                outstanding_repairs,
+            ));
+        }
 
         if !migration_status.is_alpenglow_enabled() {
             Self::handle_popular_pruned_forks(
@@ -785,6 +914,7 @@ impl RepairService {
             peers_cache: LruCache::new(REPAIR_PEERS_CACHE_CAPACITY),
             popular_pruned_forks_requests: HashSet::new(),
             outstanding_repairs: HashMap::new(),
+            last_mcp_repair_scan: Instant::now(),
         };
 
         while !exit.load(Ordering::Relaxed) {
@@ -1051,6 +1181,49 @@ impl RepairService {
         }
     }
 
+    pub fn request_repair_for_mcp_shred_from_peer(
+        cluster_info: Arc<ClusterInfo>,
+        cluster_slots: Arc<ClusterSlots>,
+        pubkey: Option<Pubkey>,
+        slot: u64,
+        proposer_index: u32,
+        shred_index: u32,
+        repair_socket: &UdpSocket,
+        outstanding_repair_requests: Arc<RwLock<OutstandingShredRepairs>>,
+    ) {
+        let mut repair_peers = vec![];
+
+        if let Some(pubkey) = pubkey {
+            let peer_repair_addr =
+                cluster_info.lookup_contact_info(&pubkey, |node| node.serve_repair(Protocol::UDP));
+            if let Some(Some(peer_repair_addr)) = peer_repair_addr {
+                trace!("Repair peer {pubkey} has valid repair socket: {peer_repair_addr:?}");
+                repair_peers.push((pubkey, peer_repair_addr));
+            }
+        };
+
+        if repair_peers.is_empty() {
+            debug!(
+                "No pubkey was provided or no valid repair socket was found. Sampling a set of \
+                 repair peers instead."
+            );
+            repair_peers = Self::get_repair_peers(cluster_info.clone(), cluster_slots, slot);
+        }
+
+        for (pubkey, peer_repair_addr) in repair_peers {
+            Self::request_repair_for_mcp_shred_from_address(
+                cluster_info.clone(),
+                pubkey,
+                peer_repair_addr,
+                slot,
+                proposer_index,
+                shred_index,
+                repair_socket,
+                outstanding_repair_requests.clone(),
+            );
+        }
+    }
+
     fn request_repair_for_shred_from_address(
         cluster_info: Arc<ClusterInfo>,
         pubkey: Pubkey,
@@ -1088,6 +1261,48 @@ impl RepairService {
             }
             Err(SendPktsError::IoError(err, _num_failed)) => {
                 error!("batch_send failed to send packet - error = {err:?}");
+            }
+        }
+    }
+
+    fn request_repair_for_mcp_shred_from_address(
+        cluster_info: Arc<ClusterInfo>,
+        pubkey: Pubkey,
+        address: SocketAddr,
+        slot: u64,
+        proposer_index: u32,
+        shred_index: u32,
+        repair_socket: &UdpSocket,
+        outstanding_repair_requests: Arc<RwLock<OutstandingShredRepairs>>,
+    ) {
+        let identity_keypair = cluster_info.keypair();
+        let repair_request = ShredRepairType::McpShred {
+            slot,
+            proposer_index,
+            shred_index,
+        };
+        let nonce = outstanding_repair_requests
+            .write()
+            .unwrap()
+            .add_request(repair_request, timestamp());
+
+        let header = RepairRequestHeader::new(cluster_info.id(), pubkey, timestamp(), nonce);
+        let request_proto = RepairProtocol::McpWindowIndex {
+            header,
+            slot,
+            proposer_index,
+            shred_index,
+        };
+        let packet_buf =
+            ServeRepair::repair_proto_to_bytes(&request_proto, &identity_keypair).unwrap();
+        let reqs = [(&packet_buf, address)];
+
+        match batch_send(repair_socket, reqs) {
+            Ok(()) => {
+                debug!("successfully sent MCP repair request to {pubkey} / {address}!");
+            }
+            Err(SendPktsError::IoError(err, _num_failed)) => {
+                error!("batch_send failed to send MCP repair packet - error = {err:?}");
             }
         }
     }
@@ -1287,27 +1502,52 @@ mod test {
         super::*,
         crate::repair::quic_endpoint::RemoteRequest,
         solana_gossip::{contact_info::ContactInfo, node::Node},
+        solana_hash::Hash,
         solana_keypair::Keypair,
         solana_ledger::{
             blockstore::{
                 make_chaining_slot_entries, make_many_slot_entries, make_slot_entries, Blockstore,
             },
             genesis_utils::{create_genesis_config, GenesisConfigInfo},
-            get_tmp_ledger_path_auto_delete,
+            get_tmp_ledger_path_auto_delete, mcp,
+            mcp_relay_attestation::{RelayAttestation, RelayAttestationEntry},
             shred::max_ticks_per_n_shreds,
         },
         solana_net_utils::sockets::bind_to_localhost_unique,
         solana_runtime::bank::Bank,
+        solana_signature::Signature,
         solana_signer::Signer,
         solana_streamer::socket::SocketAddrSpace,
         solana_time_utils::timestamp,
-        std::collections::HashSet,
+        std::collections::{HashMap, HashSet},
     };
 
     fn new_test_cluster_info() -> ClusterInfo {
         let keypair = Arc::new(Keypair::new());
         let contact_info = ContactInfo::new_localhost(&keypair.pubkey(), timestamp());
         ClusterInfo::new(contact_info, keypair, SocketAddrSpace::Unspecified)
+    }
+
+    fn store_mcp_relay_attestation(
+        blockstore: &Blockstore,
+        slot: Slot,
+        relay_index: u32,
+        proposer_indices: &[u32],
+    ) {
+        let entries = proposer_indices
+            .iter()
+            .copied()
+            .map(|proposer_index| RelayAttestationEntry {
+                proposer_index,
+                commitment: Hash::new_unique(),
+                proposer_signature: Signature::default(),
+            })
+            .collect();
+        let relay_attestation = RelayAttestation::new_unsigned(slot, relay_index, entries).unwrap();
+        let bytes = relay_attestation.to_wire_bytes().unwrap();
+        blockstore
+            .put_mcp_relay_attestation(slot, relay_index, &bytes)
+            .unwrap();
     }
 
     #[test]
@@ -1360,6 +1600,137 @@ mod test {
             }
             _ => panic!("unexpected repair protocol"),
         }
+    }
+
+    #[test]
+    pub fn test_request_repair_for_mcp_shred_from_address() {
+        let cluster_info = Arc::new(new_test_cluster_info());
+        let pubkey = cluster_info.id();
+        let slot = 101;
+        let proposer_index = 3;
+        let shred_index = 7;
+        let reader = bind_to_localhost_unique().expect("should bind");
+        let address = reader.local_addr().unwrap();
+        let sender = bind_to_localhost_unique().expect("should bind");
+        let outstanding_repair_requests = Arc::new(RwLock::new(OutstandingShredRepairs::default()));
+
+        RepairService::request_repair_for_mcp_shred_from_address(
+            cluster_info.clone(),
+            pubkey,
+            address,
+            slot,
+            proposer_index,
+            shred_index,
+            &sender,
+            outstanding_repair_requests,
+        );
+
+        let mut packets = vec![solana_packet::Packet::default(); 1];
+        let _recv_count = solana_streamer::recvmmsg::recv_mmsg(&reader, &mut packets[..]).unwrap();
+        let packet = &packets[0];
+        let Some(bytes) = packet.data(..).map(Vec::from) else {
+            panic!("packet data not found");
+        };
+        let remote_request = RemoteRequest {
+            remote_pubkey: None,
+            remote_address: packet.meta().socket_addr(),
+            bytes: Bytes::from(bytes),
+        };
+
+        let deserialized =
+            serve_repair::deserialize_request::<RepairProtocol>(&remote_request).unwrap();
+        match deserialized {
+            RepairProtocol::McpWindowIndex {
+                slot: deserialized_slot,
+                proposer_index: deserialized_proposer_index,
+                shred_index: deserialized_shred_index,
+                ..
+            } => {
+                assert_eq!(deserialized_slot, slot);
+                assert_eq!(deserialized_proposer_index, proposer_index);
+                assert_eq!(deserialized_shred_index, shred_index);
+            }
+            _ => panic!("unexpected repair protocol"),
+        }
+    }
+
+    #[test]
+    fn test_identify_mcp_repairs_enqueues_missing_shreds() {
+        let ledger_path = get_tmp_ledger_path_auto_delete!();
+        let blockstore = Blockstore::open(ledger_path.path()).unwrap();
+        let mut bank = Bank::new_for_tests(&create_genesis_config(10_000).genesis_config);
+        bank.activate_feature(&feature_set::mcp_protocol_v1::id());
+
+        let slot = 5;
+        let proposer_index = 2;
+        store_mcp_relay_attestation(&blockstore, slot, 0, &[proposer_index]);
+
+        let mut outstanding_repairs = HashMap::new();
+        let repairs = RepairService::identify_mcp_repairs(
+            &blockstore,
+            &bank,
+            MAX_REPAIR_LENGTH,
+            &mut outstanding_repairs,
+        );
+        let expected: Vec<_> = (0..mcp::NUM_RELAYS as u32)
+            .map(|shred_index| ShredRepairType::McpShred {
+                slot,
+                proposer_index,
+                shred_index,
+            })
+            .collect();
+        assert_eq!(repairs, expected);
+
+        let duplicate_repairs = RepairService::identify_mcp_repairs(
+            &blockstore,
+            &bank,
+            MAX_REPAIR_LENGTH,
+            &mut outstanding_repairs,
+        );
+        assert!(duplicate_repairs.is_empty());
+    }
+
+    #[test]
+    fn test_identify_mcp_repairs_skips_slot_with_final_execution_output() {
+        let ledger_path = get_tmp_ledger_path_auto_delete!();
+        let blockstore = Blockstore::open(ledger_path.path()).unwrap();
+        let mut bank = Bank::new_for_tests(&create_genesis_config(10_000).genesis_config);
+        bank.activate_feature(&feature_set::mcp_protocol_v1::id());
+
+        let slot = 8;
+        let proposer_index = 1;
+        store_mcp_relay_attestation(&blockstore, slot, 0, &[proposer_index]);
+        blockstore
+            .put_mcp_execution_output(slot, &[1, 2, 3])
+            .unwrap();
+
+        let repairs = RepairService::identify_mcp_repairs(
+            &blockstore,
+            &bank,
+            MAX_REPAIR_LENGTH,
+            &mut HashMap::default(),
+        );
+        assert!(repairs.is_empty());
+
+        let pending_slot = 9;
+        store_mcp_relay_attestation(&blockstore, pending_slot, 0, &[proposer_index]);
+        blockstore
+            .put_mcp_empty_execution_output(pending_slot)
+            .unwrap();
+        let repairs = RepairService::identify_mcp_repairs(
+            &blockstore,
+            &bank,
+            MAX_REPAIR_LENGTH,
+            &mut HashMap::default(),
+        );
+        let expected: Vec<_> = (0..mcp::NUM_RELAYS as u32)
+            .map(|shred_index| ShredRepairType::McpShred {
+                slot: pending_slot,
+                proposer_index,
+                shred_index,
+            })
+            .collect();
+        assert_eq!(repairs, expected);
     }
 
     #[test]
